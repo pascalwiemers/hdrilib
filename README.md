@@ -2,11 +2,12 @@
 
 HDRI Library is a Houdini 22 Python Panel for browsing folders of HDRIs and light
 textures. It caches compact previews and assigns a texture to the selected Solaris
-dome/rect light or OBJ environment light when you double-click a thumbnail.
+dome/rect light or OBJ environment light when you double-click a thumbnail. It can
+also batch-convert any enabled source texture format to Houdini `.rat` files.
 
 It has no dependencies beyond Houdini. Thumbnail conversion uses Houdini's own
 `$HFS/bin/hoiiotool`; Houdini's `iconvert` supplies the native RAT reader before the
-OpenImageIO resize/display-transform stage. All user state lives in
+OpenImageIO resize/display-transform stage and batch-writes new RAT files. All user state lives in
 `~/.houdini_hdrilib` so it survives Houdini version upgrades.
 
 ## Install with `install.py`
@@ -92,12 +93,27 @@ resolves relative to that directory.
    changing them immediately updates that root's Settings entry and scan results. This
    works for both root folders and their subfolders in Sidebar and Dropdown modes.
 4. Set the preview size and parallel worker count. The default worker count is the
-   smaller of 8 and the machine's CPU count.
+   smaller of 8 and the machine's CPU count. Thumbnail generation and RAT conversion
+   share this worker limit.
 5. Return to **Browse**, choose a location, then search by filename or toggle **Include
    subfolders**. Click **Generate thumbnails**; conversions run concurrently and previews
    appear as each finishes. **Cancel** promptly drops pending jobs and terminates active
    converter subprocesses.
-6. Select a supported light and double-click a texture:
+6. Convert textures to RAT in either of two ways:
+
+   - Select one or more thumbnails, right-click, and choose **Convert to .rat**.
+   - Click **Convert folder to .rat** beside Refresh. This scans the current folder,
+     honoring that root's Formats selection and **Include subfolders** state.
+
+   The **RAT Conversion** Settings group writes beside each source by default, or into
+   a configurable source subfolder (default `rat`). Targets append `.rat` to the full
+   source name (`sky.exr` becomes `sky.exr.rat`) so different source formats do not
+   collide. Existing targets at least as new as their sources are skipped unless
+   **Overwrite existing** is enabled, and `.rat` inputs are always
+   skipped. Conversion shares the thumbnail progress bar and Cancel button; only one
+   background batch can run at a time. The grid refreshes when a batch finishes. HDR
+   and EXR inputs are written as linear 32-bit float RATs to preserve dynamic range.
+7. Select a supported light and double-click a texture:
 
    - Solaris dome/Karma dome/rect lights use the USD `inputs:texture:file` parameter.
    - OBJ `envlight` nodes use `env_map`.
@@ -105,9 +121,10 @@ resolves relative to that directory.
 Settings are stored in `~/.houdini_hdrilib/config.json`; cached PNGs are stored in
 `~/.houdini_hdrilib/thumbs/`. Cache keys include source path, modification time, file
 size, thumbnail size, and conversion recipe, so edited textures regenerate cleanly.
-The version-3 config stores each root's path, label, color, and extension set alongside
-the location mode, preview size, and worker count. Existing version-1 and version-2
-configs are migrated on load: each root receives the old global `enabled_extensions`
+The version-4 config stores each root's path, label, color, and extension set alongside
+the location mode, preview size, worker count, and RAT output choices. Existing
+version-1 through version-3 configs are migrated on load: each root receives the old
+global `enabled_extensions`
 set, version-1 path strings become root objects, and obsolete global master/quick format
 fields are removed from the normalized config.
 The preview recipe applies a one-stop reduction and Houdini's ACES 1.0 SDR Video view
@@ -116,10 +133,11 @@ HDR highlights.
 
 ## Headless smoke test
 
-The smoke test checks strict version-3 normalization and version-1/version-2 migration,
+The smoke test checks strict version-4 normalization and version-1/version-2 migration,
 verifies different roots produce different results with RAT-only and all-format sets,
 recursively scans real `.rat` and `.hdr` inputs, imports the panel entry point, generates
-several real HDR previews in parallel, and exercises the RAT bridge:
+several real HDR previews in parallel, checks RAT target/skip behavior, converts two
+temporary HDR/EXR copies to RAT in parallel, and exercises the RAT-read bridge:
 
 ```sh
 HFS=/opt/hfs22.0 \
@@ -130,5 +148,6 @@ On macOS, use the `hython` in your Houdini install's `Resources/bin` directory. 
 library never embeds an installation path: it locates the tools through `hou.getenv("HFS")`
 or the inherited `$HFS` environment variable. A RAT-only `Could not connect to server`
 failure means `iconvert` could not reach the Houdini license server; the smoke test marks
-that specific bridge failure as environmental while still requiring all other checks to
-pass.
+that specific RAT-read or RAT-write failure as environmental while still requiring all
+other checks to pass. RAT write smoke outputs live only inside the test's temporary
+directory, leaving source libraries and existing conversion caches untouched.

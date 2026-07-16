@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import struct
 import sys
 import tempfile
@@ -19,7 +20,7 @@ PYTHON_ROOT = REPO_ROOT / "python"
 if str(PYTHON_ROOT) not in sys.path:
     sys.path.insert(0, str(PYTHON_ROOT))
 
-from hdrilib import config, files, thumbs  # noqa: E402
+from hdrilib import config, convert, files, thumbs  # noqa: E402
 import hdrilib.panel as panel  # noqa: E402
 
 
@@ -77,7 +78,7 @@ def main(argv=None) -> int:
                 stream,
             )
         migrated = config.load_config(config_file)
-        assert migrated["version"] == 3
+        assert migrated["version"] == 4
         assert migrated["roots"] == [
             {
                 "path": str(source),
@@ -90,6 +91,9 @@ def main(argv=None) -> int:
         assert "enabled_extensions" not in migrated
         assert "quick_filter_extensions" not in migrated
         assert migrated["thumbnail_workers"] == config.DEFAULT_THUMBNAIL_WORKERS
+        assert migrated["rat_output_mode"] == "alongside"
+        assert migrated["rat_subfolder_name"] == "rat"
+        assert migrated["rat_overwrite_existing"] is False
 
         # Version 2 stored richer root objects but still kept both format sets
         # globally. The master enabled set, not its quick-filter subset, seeds roots.
@@ -110,7 +114,7 @@ def main(argv=None) -> int:
                 stream,
             )
         migrated_v2 = config.load_config(config_file)
-        assert migrated_v2["version"] == 3
+        assert migrated_v2["version"] == 4
         assert migrated_v2["roots"] == [
             {
                 "path": str(source),
@@ -122,7 +126,7 @@ def main(argv=None) -> int:
 
         strict = config.normalise_config(
             {
-                "version": 3,
+                "version": 4,
                 "roots": [
                     {
                         "path": str(source),
@@ -140,11 +144,14 @@ def main(argv=None) -> int:
                 "quick_filter_extensions": ["rat", "hdr", "not-real"],
                 "thumbnail_size": 10,
                 "thumbnail_workers": 999,
+                "rat_output_mode": "elsewhere",
+                "rat_subfolder_name": "../bad",
+                "rat_overwrite_existing": "yes",
                 "include_subfolders": "yes",
                 "unknown_key": "discard me",
             }
         )
-        assert strict["version"] == 3
+        assert strict["version"] == 4
         assert strict["roots"] == [
             {
                 "path": str(source),
@@ -156,6 +163,9 @@ def main(argv=None) -> int:
         assert strict["location_ui_mode"] == "sidebar"
         assert strict["thumbnail_size"] == 64
         assert strict["thumbnail_workers"] == 64
+        assert strict["rat_output_mode"] == "alongside"
+        assert strict["rat_subfolder_name"] == "rat"
+        assert strict["rat_overwrite_existing"] is False
         assert strict["include_subfolders"] is False
         assert "unknown_key" not in strict
         assert "enabled_extensions" not in strict
@@ -191,6 +201,9 @@ def main(argv=None) -> int:
                 "location_ui_mode": "dropdown",
                 "thumbnail_size": 256,
                 "thumbnail_workers": 3,
+                "rat_output_mode": "subfolder",
+                "rat_subfolder_name": "converted-rat",
+                "rat_overwrite_existing": True,
                 "include_subfolders": True,
                 "last_folder": str(source),
                 "search_text": "church",
@@ -203,6 +216,9 @@ def main(argv=None) -> int:
         assert loaded["roots"][0]["color"] == "#336699"
         assert loaded["roots"][0]["extensions"] == [".rat"]
         assert loaded["roots"][1]["extensions"] == list(config.DEFAULT_EXTENSIONS)
+        assert loaded["rat_output_mode"] == "subfolder"
+        assert loaded["rat_subfolder_name"] == "converted-rat"
+        assert loaded["rat_overwrite_existing"] is True
 
         scans = [
             files.scan_files(
@@ -212,8 +228,44 @@ def main(argv=None) -> int:
         ]
         assert [Path(path).suffix for path in scans[0]] == [".rat"]
         assert {Path(path).suffix for path in scans[1]} == {".rat", ".hdr"}
-        print("CONFIG ok: v1/v2 migration, strict v3 normalization, round trip")
+        print("CONFIG ok: v1/v2 migration, strict v4 normalization, round trip")
         print("PER-ROOT SCAN ok: RAT-only root differs from all-formats root")
+
+        target_source = work / "targets" / "sunset.exr"
+        expected_alongside = target_source.parent / "sunset.exr.rat"
+        expected_subfolder = target_source.parent / "rat-cache" / "sunset.exr.rat"
+        assert convert.build_rat_target(target_source, "alongside", "ignored") == expected_alongside
+        assert (
+            convert.build_rat_target(target_source, "subfolder", "rat-cache")
+            == expected_subfolder
+        )
+        try:
+            convert.build_rat_target(target_source, "subfolder", "../escape")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("unsafe RAT subfolder was accepted")
+
+        skip_source = work / "skip.hdr"
+        skip_source.write_bytes(b"source")
+        skip_target = convert.build_rat_target(skip_source, "alongside", "rat")
+        skip_target.write_bytes(b"newer target")
+        now = time.time()
+        os.utime(skip_source, (now - 10.0, now - 10.0))
+        os.utime(skip_target, (now, now))
+        skipped = convert.convert_to_rat(
+            skip_source,
+            overwrite=False,
+            executable=str(work / "must-not-run-iconvert"),
+        )
+        assert skipped.skipped and skipped.reason == "target_newer"
+        already_rat = work / "already.rat"
+        already_rat.write_bytes(b"rat")
+        skipped_rat = convert.convert_to_rat(
+            already_rat, executable=str(work / "must-not-run-iconvert")
+        )
+        assert skipped_rat.skipped and skipped_rat.reason == "already_rat"
+        print("RAT TARGET/SKIP ok: alongside, subfolder, up-to-date, already-RAT")
 
         rat_files = files.scan_files(source, extensions=[".rat"], recursive=True)
         hdr_files = files.scan_files(source, extensions=[".hdr"], recursive=True)
@@ -305,6 +357,59 @@ def main(argv=None) -> int:
             "PARALLEL THUMBS ok: {} HDR files with 3 workers".format(len(parallel_sources))
         )
 
+        conversion_input = work / "rat-convert-input"
+        conversion_input.mkdir()
+        conversion_sources = []
+        for index, source_path in enumerate(hdr_files[:2]):
+            copied = conversion_input / ("input-{}{}".format(index, Path(source_path).suffix))
+            shutil.copy2(source_path, copied)
+            conversion_sources.append(str(copied))
+        assert len(conversion_sources) >= 2, "need at least two HDR/EXR inputs for RAT conversion"
+        conversion_outputs = {}
+        conversion_skips = []
+        conversion_errors = []
+        convert_completed, convert_total, convert_cancelled = convert.convert_to_rat_parallel(
+            conversion_sources,
+            mode="subfolder",
+            subfolder_name="rat",
+            overwrite=True,
+            workers=2,
+            on_result=lambda source_path, output: conversion_outputs.setdefault(
+                source_path, output
+            ),
+            on_skipped=lambda source_path, output, reason: conversion_skips.append(
+                (source_path, output, reason)
+            ),
+            on_error=lambda source_path, error: conversion_errors.append(
+                (source_path, error)
+            ),
+        )
+        assert not convert_cancelled
+        assert (convert_completed, convert_total) == (2, 2)
+        environmental_errors = [
+            (source_path, error)
+            for source_path, error in conversion_errors
+            if "license" in str(error).lower()
+            or "could not connect to server" in str(error).lower()
+        ]
+        if conversion_errors and len(environmental_errors) == len(conversion_errors):
+            print(
+                "PARALLEL RAT environmental skip: {}".format(
+                    "; ".join(str(error) for _source_path, error in conversion_errors)
+                )
+            )
+        else:
+            assert not conversion_errors, "parallel RAT failures: {}".format(
+                conversion_errors
+            )
+            assert not conversion_skips, "forced RAT conversions were skipped"
+            assert set(conversion_outputs) == set(conversion_sources)
+            for source_path, output in conversion_outputs.items():
+                assert output.endswith(Path(source_path).name + ".rat")
+                assert Path(output).parent.name == "rat"
+                assert Path(output).is_file() and Path(output).stat().st_size > 0
+            print("PARALLEL RAT ok: 2 HDR/EXR files with 2 workers")
+
         rat_source = pick_texture(rat_files, ".rat")
         try:
             output = thumbs.generate_thumbnail(
@@ -331,7 +436,10 @@ def main(argv=None) -> int:
         assert not failures, "thumbnail failures: {}".format(
             "; ".join("{}: {}".format(extension, error) for extension, error in failures)
         )
-        print("SMOKE PASS: config migration, filtered scanning, parallel HDR, RAT bridge")
+        print(
+            "SMOKE PASS: config migration, filtered scanning, parallel thumbnails, "
+            "RAT write, RAT bridge"
+        )
     return 0
 
 

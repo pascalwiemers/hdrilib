@@ -4,15 +4,16 @@ from __future__ import annotations
 
 import hashlib
 import os
-import shutil
-import subprocess
 import tempfile
 import threading
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Callable, Iterable
 
 from .config import thumbs_dir
+from .houdini import executable as _executable
+from .houdini import houdini_hfs as _houdini_hfs
+from .houdini import run_subprocess as _run
+from .jobs import JobCancelled, run_parallel
 
 
 # Recipe changes intentionally invalidate old thumbnails.
@@ -27,31 +28,8 @@ class ThumbnailError(RuntimeError):
     pass
 
 
-class ThumbnailCancelled(ThumbnailError):
+class ThumbnailCancelled(JobCancelled, ThumbnailError):
     pass
-
-
-def _houdini_hfs() -> str | None:
-    """Read HFS from HOM when available, otherwise from the process environment."""
-
-    try:
-        import hou  # type: ignore
-
-        value = hou.getenv("HFS")
-        if value:
-            return value
-    except (ImportError, AttributeError, RuntimeError):
-        pass
-    return os.environ.get("HFS")
-
-
-def _executable(name: str, hfs: str | None = None) -> str | None:
-    hfs = hfs or _houdini_hfs()
-    if hfs:
-        candidate = Path(hfs) / "bin" / name
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            return str(candidate)
-    return shutil.which(name)
 
 
 def thumbnail_tools(hfs: str | None = None) -> list[str]:
@@ -148,42 +126,6 @@ def iconvert_command(
         os.fspath(source),
         os.fspath(output),
     ]
-
-
-def _run(
-    command: list[str],
-    timeout: float,
-    cancel_event: threading.Event | None = None,
-) -> tuple[bool, str]:
-    try:
-        process = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        while True:
-            if cancel_event is not None and cancel_event.is_set():
-                process.terminate()
-                try:
-                    process.communicate(timeout=2.0)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.communicate()
-                return False, "cancelled"
-            try:
-                stdout, stderr = process.communicate(timeout=min(0.1, timeout))
-                break
-            except subprocess.TimeoutExpired:
-                timeout -= 0.1
-                if timeout <= 0:
-                    process.kill()
-                    stdout, stderr = process.communicate()
-                    return False, (stderr or stdout or "conversion timed out").strip()
-    except (OSError, subprocess.SubprocessError) as error:
-        return False, str(error)
-    detail = (stderr or stdout or "no diagnostic output").strip()
-    return process.returncode == 0, detail
 
 
 def generate_thumbnail(
@@ -320,66 +262,23 @@ def generate_thumbnails_parallel(
     """
 
     sources = [os.path.abspath(os.path.expanduser(os.fspath(path))) for path in paths]
-    total = len(sources)
-    if not total:
-        return 0, 0, bool(cancel_event and cancel_event.is_set())
-    event = cancel_event or threading.Event()
-    worker_count = max(1, min(64, int(workers)))
-    executor = ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="hdrilib-thumb")
-    source_iterator = iter(sources)
-    futures = {}
 
-    def submit_one():
-        try:
-            source = next(source_iterator)
-        except StopIteration:
-            return None
-        future = executor.submit(
-            generate_thumbnail,
+    def worker(source, event):
+        return generate_thumbnail(
             source,
             size=size,
             cache_dir=cache_dir,
             force=force,
             cancel_event=event,
         )
-        futures[future] = source
-        return future
 
-    for _index in range(min(worker_count, total)):
-        submit_one()
-    pending = set(futures)
-    completed = 0
-    try:
-        while pending:
-            if event.is_set():
-                for future in pending:
-                    future.cancel()
-            done, pending = wait(pending, timeout=0.1, return_when=FIRST_COMPLETED)
-            for future in done:
-                source = futures[future]
-                if future.cancelled():
-                    continue
-                try:
-                    output = future.result()
-                except ThumbnailCancelled:
-                    continue
-                except Exception as error:
-                    completed += 1
-                    if on_error is not None:
-                        on_error(source, error)
-                else:
-                    completed += 1
-                    if on_result is not None:
-                        on_result(source, output)
-                if on_progress is not None:
-                    on_progress(completed, total)
-                if not event.is_set():
-                    replacement = submit_one()
-                    if replacement is not None:
-                        pending.add(replacement)
-    finally:
-        if event.is_set():
-            for future in futures:
-                future.cancel()
-        executor.shutdown(wait=True)
-    return completed, total, event.is_set()
+    return run_parallel(
+        sources,
+        worker,
+        workers=workers,
+        cancel_event=cancel_event,
+        on_result=on_result,
+        on_error=on_error,
+        on_progress=on_progress,
+        thread_name_prefix="hdrilib-thumb",
+    )

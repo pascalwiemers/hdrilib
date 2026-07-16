@@ -10,7 +10,7 @@ import os
 import threading
 from pathlib import Path
 
-from . import assign, config, files, thumbs
+from . import assign, config, convert, files, thumbs
 
 try:
     from hutil.Qt import QtCore, QtGui, QtWidgets
@@ -70,6 +70,7 @@ if QtCore is not None:
     STATIC_MOVEMENT = _enum(QtWidgets.QListView, "Movement", "Static")
     EXTENDED_SELECTION = _enum(QtWidgets.QAbstractItemView, "SelectionMode", "ExtendedSelection")
     INSTANT_POPUP = _enum(QtWidgets.QToolButton, "ToolButtonPopupMode", "InstantPopup")
+    CUSTOM_CONTEXT_MENU = _enum(QtCore.Qt, "ContextMenuPolicy", "CustomContextMenu")
     STANDARD_FILE_ICON = _enum(QtWidgets.QStyle, "StandardPixmap", "SP_FileIcon")
     ITEM_IS_EDITABLE = _enum(QtCore.Qt, "ItemFlag", "ItemIsEditable")
 
@@ -120,6 +121,47 @@ if QtCore is not None:
             self.finished.emit(self._cancelled.is_set())
 
 
+    class RatConversionWorker(QtCore.QObject):
+        """Run a concurrent RAT conversion batch in one dedicated Qt thread."""
+
+        converted = Signal(str, str)
+        skipped = Signal(str, str, str)
+        progress = Signal(int, int)
+        problem = Signal(str, str)
+        finished = Signal(bool)
+
+        def __init__(self, paths, mode, subfolder_name, overwrite, workers):
+            super().__init__()
+            self._paths = list(paths)
+            self._mode = mode
+            self._subfolder_name = subfolder_name
+            self._overwrite = bool(overwrite)
+            self._workers = int(workers)
+            self._cancelled = threading.Event()
+
+        def cancel(self):
+            self._cancelled.set()
+
+        @Slot()
+        def run(self):
+            try:
+                convert.convert_to_rat_parallel(
+                    self._paths,
+                    mode=self._mode,
+                    subfolder_name=self._subfolder_name,
+                    overwrite=self._overwrite,
+                    workers=self._workers,
+                    cancel_event=self._cancelled,
+                    on_result=self.converted.emit,
+                    on_skipped=self.skipped.emit,
+                    on_error=lambda source, error: self.problem.emit(source, str(error)),
+                    on_progress=self.progress.emit,
+                )
+            except Exception as error:
+                self.problem.emit("", str(error))
+            self.finished.emit(self._cancelled.is_set())
+
+
     class HDRILibPanel(QtWidgets.QWidget):
         """Main HDRI Library widget."""
 
@@ -131,7 +173,9 @@ if QtCore is not None:
             self._all_files = []
             self._worker = None
             self._thread = None
+            self._job_kind = None
             self._generation_errors = 0
+            self._conversion_skipped = 0
             self._format_actions = {}
             self._root_format_buttons = {}
             self._updating_roots = False
@@ -164,9 +208,11 @@ if QtCore is not None:
             self.location_combo = QtWidgets.QComboBox()
             self.location_combo.setMinimumWidth(220)
             self.refresh_button = QtWidgets.QPushButton("Refresh")
+            self.convert_folder_button = QtWidgets.QPushButton("Convert folder to .rat")
             toolbar.addWidget(self.location_label)
             toolbar.addWidget(self.location_combo, 1)
             toolbar.addWidget(self.refresh_button)
+            toolbar.addWidget(self.convert_folder_button)
             layout.addLayout(toolbar)
 
             filter_bar = QtWidgets.QHBoxLayout()
@@ -202,6 +248,7 @@ if QtCore is not None:
             self.grid.setUniformItemSizes(True)
             self.grid.setWordWrap(True)
             self.grid.setSpacing(6)
+            self.grid.setContextMenuPolicy(CUSTOM_CONTEXT_MENU)
             self.splitter.addWidget(self.folder_tree)
             self.splitter.addWidget(self.grid)
             self.splitter.setStretchFactor(1, 1)
@@ -225,13 +272,15 @@ if QtCore is not None:
             layout.addWidget(self.status)
 
             self.refresh_button.clicked.connect(self._refresh)
+            self.convert_folder_button.clicked.connect(self._start_folder_conversion)
             self.search.textChanged.connect(self._search_changed)
             self.include_subfolders.toggled.connect(self._include_changed)
             self.folder_tree.currentItemChanged.connect(self._folder_changed)
             self.location_combo.currentIndexChanged.connect(self._dropdown_folder_changed)
             self.grid.itemDoubleClicked.connect(self._assign_item)
+            self.grid.customContextMenuRequested.connect(self._show_grid_context_menu)
             self.generate_button.clicked.connect(self._start_generation)
-            self.cancel_button.clicked.connect(self._cancel_generation)
+            self.cancel_button.clicked.connect(self._cancel_job)
 
         def _build_settings_tab(self):
             layout = QtWidgets.QVBoxLayout(self.settings_tab)
@@ -291,6 +340,24 @@ if QtCore is not None:
             thumbnail_layout.addRow("Preview size", self.thumbnail_size_spin)
             thumbnail_layout.addRow("Parallel workers", self.thumbnail_workers_spin)
             options_row.addWidget(thumbnail_group)
+
+            rat_group = QtWidgets.QGroupBox("RAT Conversion")
+            rat_layout = QtWidgets.QFormLayout(rat_group)
+            self.rat_alongside_radio = QtWidgets.QRadioButton("Alongside source")
+            self.rat_subfolder_radio = QtWidgets.QRadioButton("Source subfolder")
+            rat_location = QtWidgets.QVBoxLayout()
+            rat_location.addWidget(self.rat_alongside_radio)
+            rat_location.addWidget(self.rat_subfolder_radio)
+            self.rat_subfolder_name = QtWidgets.QLineEdit()
+            self.rat_subfolder_name.setPlaceholderText("rat")
+            self.rat_overwrite = QtWidgets.QCheckBox("Overwrite existing")
+            self.rat_overwrite.setToolTip(
+                "Also replace RAT files that are already at least as new as their source"
+            )
+            rat_layout.addRow("Output", rat_location)
+            rat_layout.addRow("Subfolder name", self.rat_subfolder_name)
+            rat_layout.addRow(self.rat_overwrite)
+            options_row.addWidget(rat_group)
             layout.addLayout(options_row)
 
             self.settings_add_root.clicked.connect(self._add_root)
@@ -310,6 +377,10 @@ if QtCore is not None:
             )
             self.thumbnail_size_spin.valueChanged.connect(self._thumbnail_settings_changed)
             self.thumbnail_workers_spin.valueChanged.connect(self._thumbnail_settings_changed)
+            self.rat_alongside_radio.toggled.connect(self._rat_settings_changed)
+            self.rat_subfolder_radio.toggled.connect(self._rat_settings_changed)
+            self.rat_subfolder_name.editingFinished.connect(self._rat_settings_changed)
+            self.rat_overwrite.toggled.connect(self._rat_settings_changed)
 
         def _restore_ui(self):
             self.search.blockSignals(True)
@@ -329,6 +400,24 @@ if QtCore is not None:
                 int(self._settings.get("thumbnail_workers", config.DEFAULT_THUMBNAIL_WORKERS))
             )
             self.thumbnail_workers_spin.blockSignals(False)
+            rat_mode = self._settings.get("rat_output_mode", "alongside")
+            self.rat_alongside_radio.blockSignals(True)
+            self.rat_subfolder_radio.blockSignals(True)
+            self.rat_alongside_radio.setChecked(rat_mode == "alongside")
+            self.rat_subfolder_radio.setChecked(rat_mode == "subfolder")
+            self.rat_alongside_radio.blockSignals(False)
+            self.rat_subfolder_radio.blockSignals(False)
+            self.rat_subfolder_name.blockSignals(True)
+            self.rat_subfolder_name.setText(
+                self._settings.get("rat_subfolder_name", "rat")
+            )
+            self.rat_subfolder_name.blockSignals(False)
+            self.rat_overwrite.blockSignals(True)
+            self.rat_overwrite.setChecked(
+                bool(self._settings.get("rat_overwrite_existing", False))
+            )
+            self.rat_overwrite.blockSignals(False)
+            self._update_rat_settings_enabled()
             self._apply_icon_size()
             self.set_location_ui_mode(
                 self._settings.get("location_ui_mode", "sidebar"), save=False
@@ -807,6 +896,21 @@ if QtCore is not None:
             self._apply_icon_size()
             self._populate_grid()
 
+        def _update_rat_settings_enabled(self):
+            self.rat_subfolder_name.setEnabled(self.rat_subfolder_radio.isChecked())
+
+        def _rat_settings_changed(self, _value=None):
+            mode = "subfolder" if self.rat_subfolder_radio.isChecked() else "alongside"
+            name = self.rat_subfolder_name.text().strip()
+            if not name or name in (".", "..") or "/" in name or "\\" in name:
+                name = "rat"
+                self.rat_subfolder_name.setText(name)
+            self._settings["rat_output_mode"] = mode
+            self._settings["rat_subfolder_name"] = name
+            self._settings["rat_overwrite_existing"] = self.rat_overwrite.isChecked()
+            self._update_rat_settings_enabled()
+            self._save()
+
         def _include_changed(self, _checked=False):
             self._save()
             self._populate_grid()
@@ -857,6 +961,94 @@ if QtCore is not None:
             result = assign.assign_texture(item.data(USER_ROLE))
             self.status.setText(result.message)
 
+        def _show_grid_context_menu(self, position):
+            clicked = self.grid.itemAt(position)
+            if clicked is not None and not clicked.isSelected():
+                self.grid.clearSelection()
+                clicked.setSelected(True)
+            selected = [
+                item.data(USER_ROLE)
+                for item in self.grid.selectedItems()
+                if item.data(USER_ROLE)
+            ]
+            menu = QtWidgets.QMenu(self.grid)
+            action = QAction("Convert to .rat", menu)
+            action.setEnabled(bool(selected) and self._thread is None)
+            action.triggered.connect(
+                lambda _checked=False, paths=selected: self._start_rat_conversion(
+                    paths, "selected texture"
+                )
+            )
+            menu.addAction(action)
+            menu.exec(self.grid.viewport().mapToGlobal(position))
+
+        def _start_folder_conversion(self):
+            if self._thread is not None:
+                return
+            if not self._folder or not os.path.isdir(self._folder):
+                self.status.setText("Choose a valid folder before converting to RAT.")
+                return
+            root = self._root_for_folder()
+            extensions = root.get("extensions", ()) if root is not None else ()
+            paths = (
+                files.scan_files(
+                    self._folder,
+                    extensions=extensions,
+                    recursive=self.include_subfolders.isChecked(),
+                )
+                if extensions
+                else []
+            )
+            self._start_rat_conversion(paths, "folder texture")
+
+        def _start_rat_conversion(self, paths, description):
+            if self._thread is not None:
+                return
+            paths = list(paths)
+            if not paths:
+                self.status.setText("No textures match the current RAT conversion scope.")
+                return
+
+            thread = QtCore.QThread()
+            worker = RatConversionWorker(
+                paths,
+                self._settings.get("rat_output_mode", "alongside"),
+                self._settings.get("rat_subfolder_name", "rat"),
+                bool(self._settings.get("rat_overwrite_existing", False)),
+                int(self._settings.get("thumbnail_workers", config.DEFAULT_THUMBNAIL_WORKERS)),
+            )
+            worker.moveToThread(thread)
+            thread.started.connect(worker.run)
+            worker.converted.connect(self._rat_converted)
+            worker.skipped.connect(self._rat_skipped)
+            worker.problem.connect(self._rat_problem)
+            worker.progress.connect(self._job_progress)
+            worker.finished.connect(self._conversion_finished)
+            worker.finished.connect(thread.quit)
+            worker.finished.connect(worker.deleteLater)
+            thread.finished.connect(thread.deleteLater)
+            thread.finished.connect(lambda thread=thread: self._thread_finished(thread))
+            _ACTIVE_THREADS.add(thread)
+            self._thread = thread
+            self._worker = worker
+            self._job_kind = "rat"
+            self._generation_errors = 0
+            self._conversion_skipped = 0
+            self.progress.setRange(0, len(paths))
+            self.progress.setValue(0)
+            self._set_job_controls(True)
+            workers = min(len(paths), worker._workers)
+            self.status.setText(
+                "Converting {} {}{} to RAT with {} worker{}…".format(
+                    len(paths),
+                    description,
+                    "" if len(paths) == 1 else "s",
+                    workers,
+                    "" if workers == 1 else "s",
+                )
+            )
+            thread.start()
+
         def _start_generation(self):
             if self._thread is not None:
                 return
@@ -880,7 +1072,7 @@ if QtCore is not None:
             thread.started.connect(worker.run)
             worker.thumbnail_ready.connect(self._thumbnail_ready)
             worker.problem.connect(self._thumbnail_problem)
-            worker.progress.connect(self._thumbnail_progress)
+            worker.progress.connect(self._job_progress)
             worker.finished.connect(self._generation_finished)
             worker.finished.connect(thread.quit)
             worker.finished.connect(worker.deleteLater)
@@ -889,11 +1081,11 @@ if QtCore is not None:
             _ACTIVE_THREADS.add(thread)
             self._thread = thread
             self._worker = worker
+            self._job_kind = "thumbnails"
             self._generation_errors = 0
             self.progress.setRange(0, len(pending))
             self.progress.setValue(0)
-            self.generate_button.setEnabled(False)
-            self.cancel_button.setEnabled(True)
+            self._set_job_controls(True)
             workers = min(len(pending), worker._workers)
             self.status.setText(
                 "Generating {} thumbnail{} with {} worker{}…".format(
@@ -905,13 +1097,21 @@ if QtCore is not None:
             )
             thread.start()
 
-        def _cancel_generation(self):
+        def _set_job_controls(self, running):
+            self.generate_button.setEnabled(not running)
+            self.convert_folder_button.setEnabled(not running)
+            self.cancel_button.setEnabled(running)
+
+        def _cancel_job(self):
             if self._worker is not None:
                 self._worker.cancel()
                 self.cancel_button.setEnabled(False)
-                self.status.setText("Cancelling pending and active thumbnail conversions…")
+                job = "thumbnail" if self._job_kind == "thumbnails" else "RAT"
+                self.status.setText(
+                    "Cancelling pending and active {} conversions…".format(job)
+                )
 
-        def _thumbnail_progress(self, current, total):
+        def _job_progress(self, current, total):
             self.progress.setRange(0, total)
             self.progress.setValue(current)
 
@@ -940,9 +1140,37 @@ if QtCore is not None:
             else:
                 message = "Thumbnail generation complete ({}/{})".format(completed, total)
             self.status.setText(message)
-            self.generate_button.setEnabled(True)
-            self.cancel_button.setEnabled(False)
+            self._set_job_controls(False)
             self._worker = None
+            self._job_kind = None
+
+        def _rat_converted(self, _source, _target):
+            pass
+
+        def _rat_skipped(self, _source, _target, _reason):
+            self._conversion_skipped += 1
+
+        def _rat_problem(self, source, message):
+            self._generation_errors += 1
+            concise = message.splitlines()[-1] if message else "unknown error"
+            name = os.path.basename(source) if source else "RAT worker"
+            self.status.setText("Failed {}: {}".format(name, concise))
+
+        def _conversion_finished(self, cancelled):
+            completed = self.progress.value()
+            total = self.progress.maximum()
+            converted = max(0, completed - self._generation_errors - self._conversion_skipped)
+            if cancelled:
+                message = "RAT conversion cancelled ({}/{})".format(completed, total)
+            else:
+                message = "RAT conversion complete: {} converted, {} skipped, {} failed".format(
+                    converted, self._conversion_skipped, self._generation_errors
+                )
+            self._populate_grid()
+            self.status.setText(message)
+            self._set_job_controls(False)
+            self._worker = None
+            self._job_kind = None
 
         def _thread_finished(self, thread):
             _ACTIVE_THREADS.discard(thread)

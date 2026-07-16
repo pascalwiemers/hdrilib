@@ -24,7 +24,7 @@ DEFAULT_EXTENSIONS = (
     ".tiff",
 )
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 DEFAULT_THUMBNAIL_WORKERS = min(8, os.cpu_count() or 1)
 _COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 
@@ -34,6 +34,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "location_ui_mode": "sidebar",
     "thumbnail_size": 256,
     "thumbnail_workers": DEFAULT_THUMBNAIL_WORKERS,
+    "rat_output_mode": "alongside",
+    "rat_subfolder_name": "rat",
+    "rat_overwrite_existing": False,
     "include_subfolders": False,
     "last_folder": "",
     "search_text": "",
@@ -162,6 +165,25 @@ def normalise_config(data: Mapping[str, Any] | None) -> dict[str, Any]:
     workers = data.get("thumbnail_workers")
     if isinstance(workers, int) and not isinstance(workers, bool):
         result["thumbnail_workers"] = max(1, min(64, workers))
+
+    rat_output_mode = data.get("rat_output_mode")
+    if rat_output_mode in ("alongside", "subfolder"):
+        result["rat_output_mode"] = rat_output_mode
+
+    rat_subfolder_name = data.get("rat_subfolder_name")
+    if isinstance(rat_subfolder_name, str):
+        rat_subfolder_name = rat_subfolder_name.strip()
+        if (
+            rat_subfolder_name
+            and rat_subfolder_name not in (".", "..")
+            and "/" not in rat_subfolder_name
+            and "\\" not in rat_subfolder_name
+        ):
+            result["rat_subfolder_name"] = rat_subfolder_name
+
+    rat_overwrite_existing = data.get("rat_overwrite_existing")
+    if isinstance(rat_overwrite_existing, bool):
+        result["rat_overwrite_existing"] = rat_overwrite_existing
 
     include_subfolders = data.get("include_subfolders")
     if isinstance(include_subfolders, bool):
