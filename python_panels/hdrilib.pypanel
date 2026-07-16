@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<pythonPanelDocument>
+  <interface name="hdrilib" label="HDRI Library" icon="MISC_image" showNetworkNavigationBar="false" help_url="">
+    <script><![CDATA[
+from hdrilib.panel import createInterface
+
+def onCreateInterface():
+    return createInterface()
+]]></script>
+    <includeInPaneTabMenu menu_position="0" create_separator="false"/>
+  </interface>
+</pythonPanelDocument>

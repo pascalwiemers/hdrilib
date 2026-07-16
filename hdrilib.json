@@ -1,0 +1,16 @@
+{
+  "enable": true,
+  "load_package_once": true,
+  "env": [
+    {
+      "HDRILIB": "${HDRILIB_ROOT-${HOUDINI_PACKAGE_PATH}}"
+    },
+    {
+      "PYTHONPATH": {
+        "value": "$HDRILIB/python",
+        "method": "prepend"
+      }
+    }
+  ],
+  "hpath": "$HDRILIB"
+}
