@@ -27,10 +27,28 @@ _ACTIVE_THREADS = set()
 if QtCore is not None:
     Signal = getattr(QtCore, "Signal", None) or QtCore.pyqtSignal
     Slot = getattr(QtCore, "Slot", None) or QtCore.pyqtSlot
-    try:
-        QAction = getattr(QtGui, "QAction", None) or QtWidgets.QAction
-    except AttributeError:  # headless hutil.Qt shims can lack QAction entirely
-        QAction = None
+    def _resolve_qaction():
+        # hutil.Qt's curated shim can miss QAction in both QtGui and QtWidgets,
+        # so fall back to the real PySide modules.
+        for module in (QtGui, QtWidgets):
+            try:
+                cls = getattr(module, "QAction", None)
+            except AttributeError:
+                cls = None
+            if cls is not None:
+                return cls
+        try:
+            from PySide6.QtGui import QAction as cls  # type: ignore
+            return cls
+        except ImportError:
+            pass
+        try:
+            from PySide2.QtWidgets import QAction as cls  # type: ignore
+            return cls
+        except ImportError:
+            return None
+
+    QAction = _resolve_qaction()
 
     def _enum(container, scoped_name, member):
         direct = getattr(container, member, None)
