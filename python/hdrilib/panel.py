@@ -27,6 +27,7 @@ _ACTIVE_THREADS = set()
 if QtCore is not None:
     Signal = getattr(QtCore, "Signal", None) or QtCore.pyqtSignal
     Slot = getattr(QtCore, "Slot", None) or QtCore.pyqtSlot
+
     def _resolve_qaction():
         # hutil.Qt's curated shim can miss QAction in both QtGui and QtWidgets,
         # so fall back to the real PySide modules.
@@ -39,11 +40,13 @@ if QtCore is not None:
                 return cls
         try:
             from PySide6.QtGui import QAction as cls  # type: ignore
+
             return cls
         except ImportError:
             pass
         try:
             from PySide2.QtWidgets import QAction as cls  # type: ignore
+
             return cls
         except ImportError:
             return None
@@ -54,7 +57,12 @@ if QtCore is not None:
         direct = getattr(container, member, None)
         return direct if direct is not None else getattr(getattr(container, scoped_name), member)
 
+    def _enum_value(value):
+        return getattr(value, "value", value)
+
     USER_ROLE = _enum(QtCore.Qt, "ItemDataRole", "UserRole")
+    TOOLTIP_ROLE = _enum(QtCore.Qt, "ItemDataRole", "ToolTipRole")
+    ROOT_ROLE = _enum_value(USER_ROLE) + 1
     ALIGN_CENTER = _enum(QtCore.Qt, "AlignmentFlag", "AlignCenter")
     HORIZONTAL = _enum(QtCore.Qt, "Orientation", "Horizontal")
     ICON_MODE = _enum(QtWidgets.QListView, "ViewMode", "IconMode")
@@ -63,35 +71,52 @@ if QtCore is not None:
     EXTENDED_SELECTION = _enum(QtWidgets.QAbstractItemView, "SelectionMode", "ExtendedSelection")
     INSTANT_POPUP = _enum(QtWidgets.QToolButton, "ToolButtonPopupMode", "InstantPopup")
     STANDARD_FILE_ICON = _enum(QtWidgets.QStyle, "StandardPixmap", "SP_FileIcon")
+    ITEM_IS_EDITABLE = _enum(QtCore.Qt, "ItemFlag", "ItemIsEditable")
+
+
+    class RootSettingsDelegate(QtWidgets.QStyledItemDelegate):
+        """Allow inline editing only for the optional display-label column."""
+
+        def createEditor(self, parent, option, index):
+            if index.column() != 1:
+                return None
+            return super().createEditor(parent, option, index)
 
 
     class ThumbnailWorker(QtCore.QObject):
+        """Run the concurrent thumbnail helper in one dedicated Qt thread."""
+
         thumbnail_ready = Signal(str, str)
         progress = Signal(int, int)
         problem = Signal(str, str)
         finished = Signal(bool)
 
-        def __init__(self, paths, size):
+        def __init__(self, paths, size, workers):
             super().__init__()
             self._paths = list(paths)
             self._size = int(size)
+            self._workers = int(workers)
             self._cancelled = threading.Event()
 
         def cancel(self):
+            # Called directly from the UI thread. threading.Event is intentionally
+            # used because this object's event loop is occupied while run() executes.
             self._cancelled.set()
 
         @Slot()
         def run(self):
-            total = len(self._paths)
-            for index, source in enumerate(self._paths, 1):
-                if self._cancelled.is_set():
-                    break
-                try:
-                    result = thumbs.generate_thumbnail(source, size=self._size)
-                    self.thumbnail_ready.emit(source, result)
-                except Exception as error:
-                    self.problem.emit(source, str(error))
-                self.progress.emit(index, total)
+            try:
+                thumbs.generate_thumbnails_parallel(
+                    self._paths,
+                    size=self._size,
+                    workers=self._workers,
+                    cancel_event=self._cancelled,
+                    on_result=self.thumbnail_ready.emit,
+                    on_error=lambda source, error: self.problem.emit(source, str(error)),
+                    on_progress=self.progress.emit,
+                )
+            except Exception as error:
+                self.problem.emit("", str(error))
             self.finished.emit(self._cancelled.is_set())
 
 
@@ -107,24 +132,41 @@ if QtCore is not None:
             self._thread = None
             self._generation_errors = 0
             self._format_actions = {}
+            self._master_extension_checks = {}
+            self._updating_roots = False
+            self._syncing_location = False
             self._build_ui()
             self._restore_ui()
-            self._rebuild_tree()
+            self._rebuild_root_settings()
+            self._rebuild_locations()
 
         def _build_ui(self):
             self.setObjectName("hdrilibPanel")
             outer = QtWidgets.QVBoxLayout(self)
             outer.setContentsMargins(6, 6, 6, 6)
+            self.tabs = QtWidgets.QTabWidget()
+            outer.addWidget(self.tabs)
 
-            root_bar = QtWidgets.QHBoxLayout()
-            self.add_root_button = QtWidgets.QPushButton("Add Folder…")
-            self.remove_root_button = QtWidgets.QPushButton("Remove Root")
+            self.browse_tab = QtWidgets.QWidget()
+            self.settings_tab = QtWidgets.QWidget()
+            self.tabs.addTab(self.browse_tab, "Browse")
+            self.tabs.addTab(self.settings_tab, "Settings")
+            self._build_browse_tab()
+            self._build_settings_tab()
+
+        def _build_browse_tab(self):
+            layout = QtWidgets.QVBoxLayout(self.browse_tab)
+            layout.setContentsMargins(4, 6, 4, 4)
+
+            toolbar = QtWidgets.QHBoxLayout()
+            self.location_label = QtWidgets.QLabel("Location")
+            self.location_combo = QtWidgets.QComboBox()
+            self.location_combo.setMinimumWidth(220)
             self.refresh_button = QtWidgets.QPushButton("Refresh")
-            root_bar.addWidget(self.add_root_button)
-            root_bar.addWidget(self.remove_root_button)
-            root_bar.addWidget(self.refresh_button)
-            root_bar.addStretch(1)
-            outer.addLayout(root_bar)
+            toolbar.addWidget(self.location_label)
+            toolbar.addWidget(self.location_combo, 1)
+            toolbar.addWidget(self.refresh_button)
+            layout.addLayout(toolbar)
 
             filter_bar = QtWidgets.QHBoxLayout()
             self.search = QtWidgets.QLineEdit()
@@ -145,9 +187,9 @@ if QtCore is not None:
             filter_bar.addWidget(self.search, 1)
             filter_bar.addWidget(self.include_subfolders)
             filter_bar.addWidget(self.format_button)
-            outer.addLayout(filter_bar)
+            layout.addLayout(filter_bar)
 
-            splitter = QtWidgets.QSplitter(HORIZONTAL)
+            self.splitter = QtWidgets.QSplitter(HORIZONTAL)
             self.folder_tree = QtWidgets.QTreeWidget()
             self.folder_tree.setHeaderHidden(True)
             self.folder_tree.setMinimumWidth(180)
@@ -159,10 +201,10 @@ if QtCore is not None:
             self.grid.setUniformItemSizes(True)
             self.grid.setWordWrap(True)
             self.grid.setSpacing(6)
-            splitter.addWidget(self.folder_tree)
-            splitter.addWidget(self.grid)
-            splitter.setStretchFactor(1, 1)
-            outer.addWidget(splitter, 1)
+            self.splitter.addWidget(self.folder_tree)
+            self.splitter.addWidget(self.grid)
+            self.splitter.setStretchFactor(1, 1)
+            layout.addWidget(self.splitter, 1)
 
             generation_bar = QtWidgets.QHBoxLayout()
             self.generate_button = QtWidgets.QPushButton("Generate thumbnails")
@@ -175,21 +217,105 @@ if QtCore is not None:
             generation_bar.addWidget(self.generate_button)
             generation_bar.addWidget(self.cancel_button)
             generation_bar.addWidget(self.progress, 1)
-            outer.addLayout(generation_bar)
+            layout.addLayout(generation_bar)
 
-            self.status = QtWidgets.QLabel("Add an HDRI folder to begin.")
+            self.status = QtWidgets.QLabel("Add an HDRI root in Settings to begin.")
             self.status.setWordWrap(True)
-            outer.addWidget(self.status)
+            layout.addWidget(self.status)
 
-            self.add_root_button.clicked.connect(self._add_root)
-            self.remove_root_button.clicked.connect(self._remove_root)
             self.refresh_button.clicked.connect(self._refresh)
             self.search.textChanged.connect(self._search_changed)
             self.include_subfolders.toggled.connect(self._include_changed)
             self.folder_tree.currentItemChanged.connect(self._folder_changed)
+            self.location_combo.currentIndexChanged.connect(self._dropdown_folder_changed)
             self.grid.itemDoubleClicked.connect(self._assign_item)
             self.generate_button.clicked.connect(self._start_generation)
             self.cancel_button.clicked.connect(self._cancel_generation)
+
+        def _build_settings_tab(self):
+            layout = QtWidgets.QVBoxLayout(self.settings_tab)
+            layout.setContentsMargins(8, 8, 8, 8)
+
+            roots_group = QtWidgets.QGroupBox("Root folders")
+            roots_layout = QtWidgets.QVBoxLayout(roots_group)
+            self.roots_list = QtWidgets.QTreeWidget()
+            self.roots_list.setColumnCount(3)
+            self.roots_list.setHeaderLabels(["Folder", "Display label", "Color"])
+            self.roots_list.setRootIsDecorated(False)
+            self.roots_list.setAlternatingRowColors(True)
+            self.roots_list.setItemDelegate(RootSettingsDelegate(self.roots_list))
+            roots_layout.addWidget(self.roots_list)
+            root_buttons = QtWidgets.QHBoxLayout()
+            self.settings_add_root = QtWidgets.QPushButton("Add…")
+            self.settings_remove_root = QtWidgets.QPushButton("Remove")
+            self.settings_move_up = QtWidgets.QPushButton("Move up")
+            self.settings_move_down = QtWidgets.QPushButton("Move down")
+            self.settings_color_root = QtWidgets.QPushButton("Choose color…")
+            self.settings_clear_color = QtWidgets.QPushButton("Clear color")
+            for button in (
+                self.settings_add_root,
+                self.settings_remove_root,
+                self.settings_move_up,
+                self.settings_move_down,
+                self.settings_color_root,
+                self.settings_clear_color,
+            ):
+                root_buttons.addWidget(button)
+            root_buttons.addStretch(1)
+            roots_layout.addLayout(root_buttons)
+            layout.addWidget(roots_group, 1)
+
+            options_row = QtWidgets.QHBoxLayout()
+            location_group = QtWidgets.QGroupBox("Location UI")
+            location_layout = QtWidgets.QVBoxLayout(location_group)
+            self.sidebar_radio = QtWidgets.QRadioButton("Sidebar")
+            self.dropdown_radio = QtWidgets.QRadioButton("Dropdown")
+            location_layout.addWidget(self.sidebar_radio)
+            location_layout.addWidget(self.dropdown_radio)
+            location_layout.addStretch(1)
+            options_row.addWidget(location_group)
+
+            formats_group = QtWidgets.QGroupBox("Available formats")
+            formats_layout = QtWidgets.QGridLayout(formats_group)
+            for index, extension in enumerate(config.DEFAULT_EXTENSIONS):
+                checkbox = QtWidgets.QCheckBox(extension)
+                checkbox.toggled.connect(self._master_formats_changed)
+                formats_layout.addWidget(checkbox, index // 4, index % 4)
+                self._master_extension_checks[extension] = checkbox
+            options_row.addWidget(formats_group, 1)
+
+            thumbnail_group = QtWidgets.QGroupBox("Thumbnails")
+            thumbnail_layout = QtWidgets.QFormLayout(thumbnail_group)
+            self.thumbnail_size_spin = QtWidgets.QSpinBox()
+            self.thumbnail_size_spin.setRange(64, 1024)
+            self.thumbnail_size_spin.setSingleStep(32)
+            self.thumbnail_size_spin.setSuffix(" px")
+            self.thumbnail_size_spin.setKeyboardTracking(False)
+            self.thumbnail_workers_spin = QtWidgets.QSpinBox()
+            self.thumbnail_workers_spin.setRange(1, 64)
+            self.thumbnail_workers_spin.setKeyboardTracking(False)
+            thumbnail_layout.addRow("Preview size", self.thumbnail_size_spin)
+            thumbnail_layout.addRow("Parallel workers", self.thumbnail_workers_spin)
+            options_row.addWidget(thumbnail_group)
+            layout.addLayout(options_row)
+
+            self.settings_add_root.clicked.connect(self._add_root)
+            self.settings_remove_root.clicked.connect(self._remove_root)
+            self.settings_move_up.clicked.connect(lambda: self._move_root(-1))
+            self.settings_move_down.clicked.connect(lambda: self._move_root(1))
+            self.settings_color_root.clicked.connect(self._choose_root_color)
+            self.settings_clear_color.clicked.connect(lambda: self._set_selected_root_color(""))
+            self.roots_list.itemChanged.connect(self._root_item_changed)
+            self.roots_list.currentItemChanged.connect(self._root_selection_changed)
+            self.roots_list.itemDoubleClicked.connect(self._root_item_double_clicked)
+            self.sidebar_radio.toggled.connect(
+                lambda checked: checked and self.set_location_ui_mode("sidebar")
+            )
+            self.dropdown_radio.toggled.connect(
+                lambda checked: checked and self.set_location_ui_mode("dropdown")
+            )
+            self.thumbnail_size_spin.valueChanged.connect(self._thumbnail_settings_changed)
+            self.thumbnail_workers_spin.valueChanged.connect(self._thumbnail_settings_changed)
 
         def _restore_ui(self):
             self.search.blockSignals(True)
@@ -198,12 +324,32 @@ if QtCore is not None:
             self.include_subfolders.blockSignals(True)
             self.include_subfolders.setChecked(bool(self._settings.get("include_subfolders")))
             self.include_subfolders.blockSignals(False)
-            enabled = set(self._settings.get("enabled_extensions", ()))
+
+            master = set(self._settings.get("enabled_extensions", ()))
+            quick = set(self._settings.get("quick_filter_extensions", master))
+            for extension, checkbox in self._master_extension_checks.items():
+                checkbox.blockSignals(True)
+                checkbox.setChecked(extension in master)
+                checkbox.blockSignals(False)
             for extension, action in self._format_actions.items():
                 action.blockSignals(True)
-                action.setChecked(extension in enabled)
+                action.setVisible(extension in master)
+                action.setChecked(extension in master and extension in quick)
                 action.blockSignals(False)
+            self._update_format_button()
+
+            self.thumbnail_size_spin.blockSignals(True)
+            self.thumbnail_size_spin.setValue(int(self._settings.get("thumbnail_size", 256)))
+            self.thumbnail_size_spin.blockSignals(False)
+            self.thumbnail_workers_spin.blockSignals(True)
+            self.thumbnail_workers_spin.setValue(
+                int(self._settings.get("thumbnail_workers", config.DEFAULT_THUMBNAIL_WORKERS))
+            )
+            self.thumbnail_workers_spin.blockSignals(False)
             self._apply_icon_size()
+            self.set_location_ui_mode(
+                self._settings.get("location_ui_mode", "sidebar"), save=False
+            )
 
         def _apply_icon_size(self):
             size = int(self._settings.get("thumbnail_size", 256))
@@ -214,13 +360,87 @@ if QtCore is not None:
             self._settings["last_folder"] = self._folder or ""
             self._settings["search_text"] = self.search.text()
             self._settings["include_subfolders"] = self.include_subfolders.isChecked()
-            self._settings["enabled_extensions"] = [
-                extension for extension, action in self._format_actions.items() if action.isChecked()
-            ]
+            self._settings["quick_filter_extensions"] = self._enabled_extensions()
             try:
                 self._settings = config.save_config(self._settings)
             except OSError as error:
                 self.status.setText("Could not save settings: {}".format(error))
+
+        def _root_entries(self):
+            return self._settings.get("roots", [])
+
+        def _root_display_name(self, root):
+            return root.get("label") or os.path.basename(root["path"]) or root["path"]
+
+        def _color_icon(self, color):
+            if not color:
+                return QtGui.QIcon()
+            qt_color = QtGui.QColor(color)
+            if not qt_color.isValid():
+                return QtGui.QIcon()
+            pixmap = QtGui.QPixmap(14, 14)
+            pixmap.fill(qt_color)
+            return QtGui.QIcon(pixmap)
+
+        def _rebuild_root_settings(self, selected_row=None):
+            if selected_row is None and self.roots_list.currentItem() is not None:
+                selected_row = self.roots_list.indexOfTopLevelItem(self.roots_list.currentItem())
+            self._updating_roots = True
+            self.roots_list.clear()
+            for root in self._root_entries():
+                item = QtWidgets.QTreeWidgetItem(
+                    self.roots_list, [root["path"], root.get("label", ""), root.get("color", "")]
+                )
+                item.setToolTip(0, root["path"])
+                item.setFlags(item.flags() | ITEM_IS_EDITABLE)
+                item.setIcon(2, self._color_icon(root.get("color", "")))
+            self._updating_roots = False
+            count = self.roots_list.topLevelItemCount()
+            if count:
+                row = max(0, min(count - 1, selected_row if selected_row is not None else 0))
+                self.roots_list.setCurrentItem(self.roots_list.topLevelItem(row))
+            self._root_selection_changed(self.roots_list.currentItem(), None)
+
+        def _root_selection_changed(self, current, _previous):
+            row = self.roots_list.indexOfTopLevelItem(current) if current is not None else -1
+            count = len(self._root_entries())
+            has_selection = 0 <= row < count
+            self.settings_remove_root.setEnabled(has_selection)
+            self.settings_move_up.setEnabled(has_selection and row > 0)
+            self.settings_move_down.setEnabled(has_selection and row < count - 1)
+            self.settings_color_root.setEnabled(has_selection)
+            self.settings_clear_color.setEnabled(
+                has_selection and bool(self._root_entries()[row].get("color"))
+            )
+            color = self._root_entries()[row].get("color", "") if has_selection else ""
+            self.settings_color_root.setIcon(self._color_icon(color))
+
+        def _root_item_changed(self, item, column):
+            if self._updating_roots:
+                return
+            row = self.roots_list.indexOfTopLevelItem(item)
+            if not 0 <= row < len(self._root_entries()):
+                return
+            if column != 1:
+                root = self._root_entries()[row]
+                expected = root["path"] if column == 0 else root.get("color", "")
+                self._updating_roots = True
+                item.setText(column, expected)
+                self._updating_roots = False
+                return
+            label = item.text(1).strip()
+            self._root_entries()[row]["label"] = label
+            if item.text(1) != label:
+                self._updating_roots = True
+                item.setText(1, label)
+                self._updating_roots = False
+            self._save()
+            self._rebuild_locations()
+
+        def _root_item_double_clicked(self, item, column):
+            if column == 2:
+                self.roots_list.setCurrentItem(item)
+                self._choose_root_color()
 
         def _add_root(self):
             start = self._folder or str(Path.home())
@@ -228,31 +448,67 @@ if QtCore is not None:
             if not selected:
                 return
             selected = os.path.abspath(selected)
-            roots = list(self._settings.get("roots", ()))
-            if selected not in roots:
-                roots.append(selected)
-                self._settings["roots"] = roots
-            self._folder = selected
-            self._save()
-            self._rebuild_tree()
-
-        def _remove_root(self):
-            roots = list(self._settings.get("roots", ()))
-            selected = self._folder
-            root = next(
-                (candidate for candidate in roots if selected == candidate or selected.startswith(candidate + os.sep)),
+            roots = self._root_entries()
+            existing = next(
+                (index for index, root in enumerate(roots) if root["path"] == selected),
                 None,
             )
-            if root is None:
-                self.status.setText("Select a folder belonging to a configured root.")
-                return
-            roots.remove(root)
-            self._settings["roots"] = roots
-            self._folder = roots[0] if roots else ""
+            if existing is None:
+                roots.append({"path": selected, "label": "", "color": ""})
+                row = len(roots) - 1
+            else:
+                row = existing
+            self._folder = selected
             self._save()
-            self._rebuild_tree()
+            self._rebuild_root_settings(row)
+            self._rebuild_locations()
 
-        def _add_tree_directory(self, path, parent):
+        def _remove_root(self):
+            item = self.roots_list.currentItem()
+            row = self.roots_list.indexOfTopLevelItem(item) if item is not None else -1
+            roots = self._root_entries()
+            if not 0 <= row < len(roots):
+                return
+            removed = roots.pop(row)["path"]
+            if self._folder == removed or self._folder.startswith(removed + os.sep):
+                self._folder = roots[0]["path"] if roots else ""
+            self._save()
+            self._rebuild_root_settings(min(row, len(roots) - 1))
+            self._rebuild_locations()
+
+        def _move_root(self, offset):
+            item = self.roots_list.currentItem()
+            row = self.roots_list.indexOfTopLevelItem(item) if item is not None else -1
+            destination = row + int(offset)
+            roots = self._root_entries()
+            if not 0 <= row < len(roots) or not 0 <= destination < len(roots):
+                return
+            roots[row], roots[destination] = roots[destination], roots[row]
+            self._save()
+            self._rebuild_root_settings(destination)
+            self._rebuild_locations()
+
+        def _choose_root_color(self):
+            item = self.roots_list.currentItem()
+            row = self.roots_list.indexOfTopLevelItem(item) if item is not None else -1
+            if not 0 <= row < len(self._root_entries()):
+                return
+            current = QtGui.QColor(self._root_entries()[row].get("color", ""))
+            color = QtWidgets.QColorDialog.getColor(current, self, "Choose folder color")
+            if color.isValid():
+                self._set_selected_root_color(color.name())
+
+        def _set_selected_root_color(self, color):
+            item = self.roots_list.currentItem()
+            row = self.roots_list.indexOfTopLevelItem(item) if item is not None else -1
+            if not 0 <= row < len(self._root_entries()):
+                return
+            self._root_entries()[row]["color"] = color
+            self._save()
+            self._rebuild_root_settings(row)
+            self._rebuild_locations()
+
+        def _add_tree_directory(self, path, parent, root, combo_prefix, seen_combo_paths):
             try:
                 directories = sorted(
                     (
@@ -264,24 +520,56 @@ if QtCore is not None:
                 )
             except OSError:
                 return
+            icon = self._color_icon(root.get("color", ""))
             for directory in directories:
                 item = QtWidgets.QTreeWidgetItem(parent, [directory.name])
                 item.setData(0, USER_ROLE, directory.path)
-                self._add_tree_directory(directory.path, item)
+                item.setData(0, ROOT_ROLE, root["path"])
+                item.setToolTip(0, directory.path)
+                item.setIcon(0, icon)
+                relative = os.path.relpath(directory.path, root["path"]).replace(os.sep, " / ")
+                self._add_combo_folder(
+                    directory.path,
+                    "{} / {}".format(combo_prefix, relative),
+                    root,
+                    seen_combo_paths,
+                )
+                self._add_tree_directory(
+                    directory.path, item, root, combo_prefix, seen_combo_paths
+                )
 
-        def _rebuild_tree(self):
+        def _add_combo_folder(self, path, label, root, seen_paths):
+            if path in seen_paths:
+                return
+            seen_paths.add(path)
+            self.location_combo.addItem(self._color_icon(root.get("color", "")), label, path)
+            index = self.location_combo.count() - 1
+            self.location_combo.setItemData(index, path, TOOLTIP_ROLE)
+            self.location_combo.setItemData(index, root["path"], ROOT_ROLE)
+
+        def _rebuild_locations(self):
+            self._syncing_location = True
             self.folder_tree.blockSignals(True)
+            self.location_combo.blockSignals(True)
             self.folder_tree.clear()
+            self.location_combo.clear()
             selected_item = None
-            for root in self._settings.get("roots", ()):
-                if not os.path.isdir(root):
+            seen_combo_paths = set()
+            for root in self._root_entries():
+                path = root["path"]
+                if not os.path.isdir(path):
                     continue
-                item = QtWidgets.QTreeWidgetItem(self.folder_tree, [os.path.basename(root) or root])
-                item.setToolTip(0, root)
-                item.setData(0, USER_ROLE, root)
-                self._add_tree_directory(root, item)
-                if self._folder == root:
+                label = self._root_display_name(root)
+                item = QtWidgets.QTreeWidgetItem(self.folder_tree, [label])
+                item.setToolTip(0, path)
+                item.setData(0, USER_ROLE, path)
+                item.setData(0, ROOT_ROLE, path)
+                item.setIcon(0, self._color_icon(root.get("color", "")))
+                self._add_combo_folder(path, label, root, seen_combo_paths)
+                self._add_tree_directory(path, item, root, label, seen_combo_paths)
+                if self._folder == path:
                     selected_item = item
+
             if self._folder and selected_item is None:
                 iterator = QtWidgets.QTreeWidgetItemIterator(self.folder_tree)
                 while iterator.value():
@@ -293,24 +581,112 @@ if QtCore is not None:
             if selected_item is None and self.folder_tree.topLevelItemCount():
                 selected_item = self.folder_tree.topLevelItem(0)
                 self._folder = selected_item.data(0, USER_ROLE)
-            self.folder_tree.blockSignals(False)
             if selected_item is not None:
                 self.folder_tree.setCurrentItem(selected_item)
                 self.folder_tree.scrollToItem(selected_item)
+            combo_index = self.location_combo.findData(self._folder, USER_ROLE)
+            if combo_index >= 0:
+                self.location_combo.setCurrentIndex(combo_index)
+            self.folder_tree.blockSignals(False)
+            self.location_combo.blockSignals(False)
+            self._syncing_location = False
             self._populate_grid()
 
         def _folder_changed(self, current, _previous):
-            if current is None:
+            if current is None or self._syncing_location:
                 return
-            self._folder = current.data(0, USER_ROLE)
+            self._set_folder(current.data(0, USER_ROLE), sync_tree=False)
+
+        def _dropdown_folder_changed(self, index):
+            if index < 0 or self._syncing_location:
+                return
+            self._set_folder(self.location_combo.itemData(index, USER_ROLE), sync_combo=False)
+
+        def _set_folder(self, path, sync_tree=True, sync_combo=True):
+            if not path:
+                return
+            self._folder = path
+            self._syncing_location = True
+            if sync_combo:
+                index = self.location_combo.findData(path, USER_ROLE)
+                if index >= 0:
+                    self.location_combo.setCurrentIndex(index)
+            if sync_tree:
+                iterator = QtWidgets.QTreeWidgetItemIterator(self.folder_tree)
+                while iterator.value():
+                    item = iterator.value()
+                    if item.data(0, USER_ROLE) == path:
+                        self.folder_tree.setCurrentItem(item)
+                        break
+                    iterator += 1
+            self._syncing_location = False
             self._save()
             self._populate_grid()
 
+        def set_location_ui_mode(self, mode, save=True):
+            """Switch Browse location controls live; useful to host integrations too."""
+
+            if mode not in ("sidebar", "dropdown"):
+                raise ValueError("location UI mode must be 'sidebar' or 'dropdown'")
+            self._settings["location_ui_mode"] = mode
+            self.sidebar_radio.blockSignals(True)
+            self.dropdown_radio.blockSignals(True)
+            self.sidebar_radio.setChecked(mode == "sidebar")
+            self.dropdown_radio.setChecked(mode == "dropdown")
+            self.sidebar_radio.blockSignals(False)
+            self.dropdown_radio.blockSignals(False)
+            sidebar = mode == "sidebar"
+            self.folder_tree.setVisible(sidebar)
+            self.location_label.setVisible(not sidebar)
+            self.location_combo.setVisible(not sidebar)
+            if save:
+                self._save()
+
         def _enabled_extensions(self):
-            return [extension for extension, action in self._format_actions.items() if action.isChecked()]
+            master = set(self._settings.get("enabled_extensions", ()))
+            return [
+                extension
+                for extension, action in self._format_actions.items()
+                if extension in master and action.isChecked()
+            ]
+
+        def _update_format_button(self):
+            selected = len(self._enabled_extensions())
+            available = len(self._settings.get("enabled_extensions", ()))
+            self.format_button.setText("Formats ({}/{})".format(selected, available))
+            self.format_button.setEnabled(bool(available))
 
         def _formats_changed(self, _checked=False):
+            self._update_format_button()
             self._save()
+            self._populate_grid()
+
+        def _master_formats_changed(self, _checked=False):
+            old_master = set(self._settings.get("enabled_extensions", ()))
+            new_master = {
+                extension
+                for extension, checkbox in self._master_extension_checks.items()
+                if checkbox.isChecked()
+            }
+            quick = set(self._enabled_extensions())
+            quick = (quick & new_master) | (new_master - old_master)
+            self._settings["enabled_extensions"] = [
+                extension for extension in config.DEFAULT_EXTENSIONS if extension in new_master
+            ]
+            for extension, action in self._format_actions.items():
+                action.blockSignals(True)
+                action.setVisible(extension in new_master)
+                action.setChecked(extension in quick)
+                action.blockSignals(False)
+            self._update_format_button()
+            self._save()
+            self._populate_grid()
+
+        def _thumbnail_settings_changed(self, _value=None):
+            self._settings["thumbnail_size"] = self.thumbnail_size_spin.value()
+            self._settings["thumbnail_workers"] = self.thumbnail_workers_spin.value()
+            self._save()
+            self._apply_icon_size()
             self._populate_grid()
 
         def _include_changed(self, _checked=False):
@@ -322,20 +698,26 @@ if QtCore is not None:
             self._populate_grid()
 
         def _refresh(self):
-            self._rebuild_tree()
+            self._rebuild_locations()
             self.status.setText("Folder list refreshed.")
 
         def _populate_grid(self):
             self.grid.clear()
             if not self._folder or not os.path.isdir(self._folder):
                 self._all_files = []
+                if not self._root_entries():
+                    self.status.setText("Add an HDRI root in Settings to begin.")
                 return
             extensions = self._enabled_extensions()
-            self._all_files = files.scan_files(
-                self._folder,
-                extensions=extensions,
-                recursive=self.include_subfolders.isChecked(),
-            ) if extensions else []
+            self._all_files = (
+                files.scan_files(
+                    self._folder,
+                    extensions=extensions,
+                    recursive=self.include_subfolders.isChecked(),
+                )
+                if extensions
+                else []
+            )
             query = self.search.text().strip().lower()
             visible = [path for path in self._all_files if query in os.path.basename(path).lower()]
             fallback_icon = self.style().standardIcon(STANDARD_FILE_ICON)
@@ -348,7 +730,9 @@ if QtCore is not None:
                 cached = thumbs.cached_thumbnail(path, size=size)
                 item.setIcon(QtGui.QIcon(cached) if cached else fallback_icon)
                 self.grid.addItem(item)
-            self.status.setText("{} texture{}".format(len(visible), "" if len(visible) == 1 else "s"))
+            self.status.setText(
+                "{} texture{}".format(len(visible), "" if len(visible) == 1 else "s")
+            )
 
         def _assign_item(self, item):
             result = assign.assign_texture(item.data(USER_ROLE))
@@ -358,13 +742,21 @@ if QtCore is not None:
             if self._thread is not None:
                 return
             size = int(self._settings.get("thumbnail_size", 256))
-            pending = [path for path in self._all_files if not thumbs.cached_thumbnail(path, size=size)]
+            pending = [
+                path
+                for path in self._all_files
+                if not thumbs.cached_thumbnail(path, size=size)
+            ]
             if not pending:
                 self.status.setText("All thumbnails for this view are cached.")
                 return
 
             thread = QtCore.QThread()
-            worker = ThumbnailWorker(pending, size)
+            worker = ThumbnailWorker(
+                pending,
+                size,
+                int(self._settings.get("thumbnail_workers", config.DEFAULT_THUMBNAIL_WORKERS)),
+            )
             worker.moveToThread(thread)
             thread.started.connect(worker.run)
             worker.thumbnail_ready.connect(self._thumbnail_ready)
@@ -372,9 +764,9 @@ if QtCore is not None:
             worker.progress.connect(self._thumbnail_progress)
             worker.finished.connect(self._generation_finished)
             worker.finished.connect(thread.quit)
-            thread.finished.connect(worker.deleteLater)
+            worker.finished.connect(worker.deleteLater)
             thread.finished.connect(thread.deleteLater)
-            thread.finished.connect(lambda thread=thread: _ACTIVE_THREADS.discard(thread))
+            thread.finished.connect(lambda thread=thread: self._thread_finished(thread))
             _ACTIVE_THREADS.add(thread)
             self._thread = thread
             self._worker = worker
@@ -383,14 +775,22 @@ if QtCore is not None:
             self.progress.setValue(0)
             self.generate_button.setEnabled(False)
             self.cancel_button.setEnabled(True)
-            self.status.setText("Generating {} thumbnail{}…".format(len(pending), "" if len(pending) == 1 else "s"))
+            workers = min(len(pending), worker._workers)
+            self.status.setText(
+                "Generating {} thumbnail{} with {} worker{}…".format(
+                    len(pending),
+                    "" if len(pending) == 1 else "s",
+                    workers,
+                    "" if workers == 1 else "s",
+                )
+            )
             thread.start()
 
         def _cancel_generation(self):
             if self._worker is not None:
                 self._worker.cancel()
                 self.cancel_button.setEnabled(False)
-                self.status.setText("Cancelling after the current thumbnail…")
+                self.status.setText("Cancelling pending and active thumbnail conversions…")
 
         def _thumbnail_progress(self, current, total):
             self.progress.setRange(0, total)
@@ -406,7 +806,8 @@ if QtCore is not None:
         def _thumbnail_problem(self, source, message):
             self._generation_errors += 1
             concise = message.splitlines()[-1] if message else "unknown error"
-            self.status.setText("Failed {}: {}".format(os.path.basename(source), concise))
+            name = os.path.basename(source) if source else "thumbnail worker"
+            self.status.setText("Failed {}: {}".format(name, concise))
 
         def _generation_finished(self, cancelled):
             completed = self.progress.value()
@@ -422,8 +823,12 @@ if QtCore is not None:
             self.status.setText(message)
             self.generate_button.setEnabled(True)
             self.cancel_button.setEnabled(False)
-            self._thread = None
             self._worker = None
+
+        def _thread_finished(self, thread):
+            _ACTIVE_THREADS.discard(thread)
+            if self._thread is thread:
+                self._thread = None
 
         def closeEvent(self, event):
             self._save()
@@ -436,7 +841,9 @@ else:
 
     class HDRILibPanel:  # type: ignore
         def __init__(self, *args, **kwargs):
-            raise RuntimeError("HDRI Library requires Houdini's hutil.Qt: {}".format(_QT_IMPORT_ERROR))
+            raise RuntimeError(
+                "HDRI Library requires Houdini's hutil.Qt: {}".format(_QT_IMPORT_ERROR)
+            )
 
 
 def createInterface():

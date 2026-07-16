@@ -7,7 +7,11 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
+from typing import Callable, Iterable
+
 from .config import thumbs_dir
 
 
@@ -20,6 +24,10 @@ VIEW = "ACES 1.0 - SDR Video"
 
 
 class ThumbnailError(RuntimeError):
+    pass
+
+
+class ThumbnailCancelled(ThumbnailError):
     pass
 
 
@@ -142,20 +150,40 @@ def iconvert_command(
     ]
 
 
-def _run(command: list[str], timeout: float) -> tuple[bool, str]:
+def _run(
+    command: list[str],
+    timeout: float,
+    cancel_event: threading.Event | None = None,
+) -> tuple[bool, str]:
     try:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             command,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout,
-            check=False,
         )
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                process.terminate()
+                try:
+                    process.communicate(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.communicate()
+                return False, "cancelled"
+            try:
+                stdout, stderr = process.communicate(timeout=min(0.1, timeout))
+                break
+            except subprocess.TimeoutExpired:
+                timeout -= 0.1
+                if timeout <= 0:
+                    process.kill()
+                    stdout, stderr = process.communicate()
+                    return False, (stderr or stdout or "conversion timed out").strip()
     except (OSError, subprocess.SubprocessError) as error:
         return False, str(error)
-    detail = (completed.stderr or completed.stdout or "no diagnostic output").strip()
-    return completed.returncode == 0, detail
+    detail = (stderr or stdout or "no diagnostic output").strip()
+    return process.returncode == 0, detail
 
 
 def generate_thumbnail(
@@ -165,9 +193,12 @@ def generate_thumbnail(
     force: bool = False,
     tool: str | None = None,
     timeout: float = 180.0,
+    cancel_event: threading.Event | None = None,
 ) -> str:
     """Generate and cache a PNG thumbnail, returning its absolute path."""
 
+    if cancel_event is not None and cancel_event.is_set():
+        raise ThumbnailCancelled("Thumbnail generation cancelled")
     source_path = Path(source).expanduser().resolve()
     if not source_path.is_file():
         raise ThumbnailError("Source image does not exist: {}".format(source_path))
@@ -208,18 +239,26 @@ def generate_thumbnail(
                 )
                 os.close(bridge_fd)
                 os.unlink(bridge_name)
-                ok, detail = _run(iconvert_command(iconvert, source_path, bridge_name), timeout)
+                ok, detail = _run(
+                    iconvert_command(iconvert, source_path, bridge_name), timeout, cancel_event
+                )
+                if cancel_event is not None and cancel_event.is_set():
+                    raise ThumbnailCancelled("Thumbnail generation cancelled")
                 if not ok or not Path(bridge_name).is_file():
                     raise ThumbnailError("iconvert RAT bridge failed: {}".format(detail))
                 conversion_source = Path(bridge_name)
 
             command = hoiiotool_command(hoiiotool, conversion_source, temporary_name, size)
-            ok, detail = _run(command, timeout)
+            ok, detail = _run(command, timeout, cancel_event)
+            if cancel_event is not None and cancel_event.is_set():
+                raise ThumbnailCancelled("Thumbnail generation cancelled")
             temporary = Path(temporary_name)
             if ok and temporary.is_file() and temporary.stat().st_size > 0:
                 os.replace(str(temporary), str(target))
                 return str(target)
             errors.append("{}: {}".format(hoiiotool, detail))
+        except ThumbnailCancelled:
+            raise
         except (OSError, ThumbnailError) as error:
             errors.append(str(error))
         finally:
@@ -243,7 +282,9 @@ def generate_thumbnail(
         try:
             os.unlink(temporary_name)
             command = [iconvert, "-d", "8", "-g", "auto", str(source_path), temporary_name]
-            ok, detail = _run(command, timeout)
+            ok, detail = _run(command, timeout, cancel_event)
+            if cancel_event is not None and cancel_event.is_set():
+                raise ThumbnailCancelled("Thumbnail generation cancelled")
             temporary = Path(temporary_name)
             if ok and temporary.is_file() and temporary.stat().st_size > 0:
                 os.replace(str(temporary), str(target))
@@ -254,4 +295,91 @@ def generate_thumbnail(
                 os.unlink(temporary_name)
             except OSError:
                 pass
-    raise ThumbnailError("Thumbnail generation failed for {}\n{}".format(source_path, "\n".join(errors)))
+    raise ThumbnailError(
+        "Thumbnail generation failed for {}\n{}".format(source_path, "\n".join(errors))
+    )
+
+
+def generate_thumbnails_parallel(
+    paths: Iterable[str | os.PathLike[str]],
+    size: int = 256,
+    workers: int = 1,
+    cache_dir: str | os.PathLike[str] | None = None,
+    force: bool = False,
+    cancel_event: threading.Event | None = None,
+    on_result: Callable[[str, str], None] | None = None,
+    on_error: Callable[[str, Exception], None] | None = None,
+    on_progress: Callable[[int, int], None] | None = None,
+) -> tuple[int, int, bool]:
+    """Generate thumbnails concurrently and report completions from this thread.
+
+    Callbacks run on the calling thread, never on executor threads. This makes the
+    helper safe for a Qt worker object to translate into queued signals. Cancellation
+    prevents queued futures from starting and terminates active converter subprocesses.
+    The return value is ``(completed, total, cancelled)``; failures count as completed.
+    """
+
+    sources = [os.path.abspath(os.path.expanduser(os.fspath(path))) for path in paths]
+    total = len(sources)
+    if not total:
+        return 0, 0, bool(cancel_event and cancel_event.is_set())
+    event = cancel_event or threading.Event()
+    worker_count = max(1, min(64, int(workers)))
+    executor = ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="hdrilib-thumb")
+    source_iterator = iter(sources)
+    futures = {}
+
+    def submit_one():
+        try:
+            source = next(source_iterator)
+        except StopIteration:
+            return None
+        future = executor.submit(
+            generate_thumbnail,
+            source,
+            size=size,
+            cache_dir=cache_dir,
+            force=force,
+            cancel_event=event,
+        )
+        futures[future] = source
+        return future
+
+    for _index in range(min(worker_count, total)):
+        submit_one()
+    pending = set(futures)
+    completed = 0
+    try:
+        while pending:
+            if event.is_set():
+                for future in pending:
+                    future.cancel()
+            done, pending = wait(pending, timeout=0.1, return_when=FIRST_COMPLETED)
+            for future in done:
+                source = futures[future]
+                if future.cancelled():
+                    continue
+                try:
+                    output = future.result()
+                except ThumbnailCancelled:
+                    continue
+                except Exception as error:
+                    completed += 1
+                    if on_error is not None:
+                        on_error(source, error)
+                else:
+                    completed += 1
+                    if on_result is not None:
+                        on_result(source, output)
+                if on_progress is not None:
+                    on_progress(completed, total)
+                if not event.is_set():
+                    replacement = submit_one()
+                    if replacement is not None:
+                        pending.add(replacement)
+    finally:
+        if event.is_set():
+            for future in futures:
+                future.cancel()
+        executor.shutdown(wait=True)
+    return completed, total, event.is_set()
