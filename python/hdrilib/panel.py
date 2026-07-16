@@ -10,7 +10,7 @@ import os
 import threading
 from pathlib import Path
 
-from . import assign, config, convert, files, thumbs
+from . import assign, config, convert, files, resize, thumbs
 
 try:
     from hutil.Qt import QtCore, QtGui, QtWidgets
@@ -162,6 +162,49 @@ if QtCore is not None:
             self.finished.emit(self._cancelled.is_set())
 
 
+    class LowResWorker(QtCore.QObject):
+        """Run one low-resolution rung as a concurrent batch."""
+
+        resized = Signal(str)
+        skipped = Signal(str, str, str)
+        progress = Signal(int, int)
+        problem = Signal(str, str)
+        finished = Signal(bool)
+
+        def __init__(self, paths, width, mode, also_rat, overwrite, workers):
+            super().__init__()
+            self._paths = list(paths)
+            self._width = int(width)
+            self._mode = mode
+            self._also_rat = bool(also_rat)
+            self._overwrite = bool(overwrite)
+            self._workers = int(workers)
+            self._cancelled = threading.Event()
+
+        def cancel(self):
+            self._cancelled.set()
+
+        @Slot()
+        def run(self):
+            try:
+                resize.resize_to_rung_parallel(
+                    self._paths,
+                    self._width,
+                    mode=self._mode,
+                    also_rat=self._also_rat,
+                    overwrite=self._overwrite,
+                    workers=self._workers,
+                    cancel_event=self._cancelled,
+                    on_result=lambda source, _result: self.resized.emit(source),
+                    on_skipped=self.skipped.emit,
+                    on_error=lambda source, error: self.problem.emit(source, str(error)),
+                    on_progress=self.progress.emit,
+                )
+            except Exception as error:
+                self.problem.emit("", str(error))
+            self.finished.emit(self._cancelled.is_set())
+
+
     class HDRILibPanel(QtWidgets.QWidget):
         """Main HDRI Library widget."""
 
@@ -209,10 +252,12 @@ if QtCore is not None:
             self.location_combo.setMinimumWidth(220)
             self.refresh_button = QtWidgets.QPushButton("Refresh")
             self.convert_folder_button = QtWidgets.QPushButton("Convert folder to .rat")
+            self.lowres_folder_button = QtWidgets.QPushButton("Create low-res…")
             toolbar.addWidget(self.location_label)
             toolbar.addWidget(self.location_combo, 1)
             toolbar.addWidget(self.refresh_button)
             toolbar.addWidget(self.convert_folder_button)
+            toolbar.addWidget(self.lowres_folder_button)
             layout.addLayout(toolbar)
 
             filter_bar = QtWidgets.QHBoxLayout()
@@ -273,6 +318,7 @@ if QtCore is not None:
 
             self.refresh_button.clicked.connect(self._refresh)
             self.convert_folder_button.clicked.connect(self._start_folder_conversion)
+            self.lowres_folder_button.clicked.connect(self._show_folder_lowres_menu)
             self.search.textChanged.connect(self._search_changed)
             self.include_subfolders.toggled.connect(self._include_changed)
             self.folder_tree.currentItemChanged.connect(self._folder_changed)
@@ -317,7 +363,7 @@ if QtCore is not None:
             roots_layout.addLayout(root_buttons)
             layout.addWidget(roots_group, 1)
 
-            options_row = QtWidgets.QHBoxLayout()
+            options_grid = QtWidgets.QGridLayout()
             location_group = QtWidgets.QGroupBox("Location UI")
             location_layout = QtWidgets.QVBoxLayout(location_group)
             self.sidebar_radio = QtWidgets.QRadioButton("Sidebar")
@@ -325,7 +371,7 @@ if QtCore is not None:
             location_layout.addWidget(self.sidebar_radio)
             location_layout.addWidget(self.dropdown_radio)
             location_layout.addStretch(1)
-            options_row.addWidget(location_group)
+            options_grid.addWidget(location_group, 0, 0)
 
             thumbnail_group = QtWidgets.QGroupBox("Thumbnails")
             thumbnail_layout = QtWidgets.QFormLayout(thumbnail_group)
@@ -339,7 +385,7 @@ if QtCore is not None:
             self.thumbnail_workers_spin.setKeyboardTracking(False)
             thumbnail_layout.addRow("Preview size", self.thumbnail_size_spin)
             thumbnail_layout.addRow("Parallel workers", self.thumbnail_workers_spin)
-            options_row.addWidget(thumbnail_group)
+            options_grid.addWidget(thumbnail_group, 0, 1)
 
             rat_group = QtWidgets.QGroupBox("RAT Conversion")
             rat_layout = QtWidgets.QFormLayout(rat_group)
@@ -357,8 +403,25 @@ if QtCore is not None:
             rat_layout.addRow("Output", rat_location)
             rat_layout.addRow("Subfolder name", self.rat_subfolder_name)
             rat_layout.addRow(self.rat_overwrite)
-            options_row.addWidget(rat_group)
-            layout.addLayout(options_row)
+            options_grid.addWidget(rat_group, 1, 0)
+
+            lowres_group = QtWidgets.QGroupBox("Low-Res Variants")
+            lowres_layout = QtWidgets.QFormLayout(lowres_group)
+            self.lowres_alongside_radio = QtWidgets.QRadioButton("Alongside source")
+            self.lowres_subfolder_radio = QtWidgets.QRadioButton("Resolution subfolder")
+            lowres_location = QtWidgets.QVBoxLayout()
+            lowres_location.addWidget(self.lowres_alongside_radio)
+            lowres_location.addWidget(self.lowres_subfolder_radio)
+            self.lowres_also_rat = QtWidgets.QCheckBox("Also convert to .rat")
+            self.lowres_also_rat.setToolTip(
+                "Keep the same-format variant and add a mipmapped RAT companion"
+            )
+            self.lowres_overwrite = QtWidgets.QCheckBox("Overwrite existing")
+            lowres_layout.addRow("Output", lowres_location)
+            lowres_layout.addRow(self.lowres_also_rat)
+            lowres_layout.addRow(self.lowres_overwrite)
+            options_grid.addWidget(lowres_group, 1, 1)
+            layout.addLayout(options_grid)
 
             self.settings_add_root.clicked.connect(self._add_root)
             self.settings_remove_root.clicked.connect(self._remove_root)
@@ -381,6 +444,10 @@ if QtCore is not None:
             self.rat_subfolder_radio.toggled.connect(self._rat_settings_changed)
             self.rat_subfolder_name.editingFinished.connect(self._rat_settings_changed)
             self.rat_overwrite.toggled.connect(self._rat_settings_changed)
+            self.lowres_alongside_radio.toggled.connect(self._lowres_settings_changed)
+            self.lowres_subfolder_radio.toggled.connect(self._lowres_settings_changed)
+            self.lowres_also_rat.toggled.connect(self._lowres_settings_changed)
+            self.lowres_overwrite.toggled.connect(self._lowres_settings_changed)
 
         def _restore_ui(self):
             self.search.blockSignals(True)
@@ -418,6 +485,23 @@ if QtCore is not None:
             )
             self.rat_overwrite.blockSignals(False)
             self._update_rat_settings_enabled()
+            lowres_mode = self._settings.get("lowres_output_mode", "alongside")
+            self.lowres_alongside_radio.blockSignals(True)
+            self.lowres_subfolder_radio.blockSignals(True)
+            self.lowres_alongside_radio.setChecked(lowres_mode == "alongside")
+            self.lowres_subfolder_radio.setChecked(lowres_mode == "subfolder")
+            self.lowres_alongside_radio.blockSignals(False)
+            self.lowres_subfolder_radio.blockSignals(False)
+            self.lowres_also_rat.blockSignals(True)
+            self.lowres_also_rat.setChecked(
+                bool(self._settings.get("lowres_also_rat", False))
+            )
+            self.lowres_also_rat.blockSignals(False)
+            self.lowres_overwrite.blockSignals(True)
+            self.lowres_overwrite.setChecked(
+                bool(self._settings.get("lowres_overwrite_existing", False))
+            )
+            self.lowres_overwrite.blockSignals(False)
             self._apply_icon_size()
             self.set_location_ui_mode(
                 self._settings.get("location_ui_mode", "sidebar"), save=False
@@ -911,6 +995,14 @@ if QtCore is not None:
             self._update_rat_settings_enabled()
             self._save()
 
+        def _lowres_settings_changed(self, _value=None):
+            self._settings["lowres_output_mode"] = (
+                "subfolder" if self.lowres_subfolder_radio.isChecked() else "alongside"
+            )
+            self._settings["lowres_also_rat"] = self.lowres_also_rat.isChecked()
+            self._settings["lowres_overwrite_existing"] = self.lowres_overwrite.isChecked()
+            self._save()
+
         def _include_changed(self, _checked=False):
             self._save()
             self._populate_grid()
@@ -980,17 +1072,16 @@ if QtCore is not None:
                 )
             )
             menu.addAction(action)
+            lowres_menu = menu.addMenu("Create Low-Res Versions")
+            self._populate_lowres_menu(lowres_menu, selected, "selected texture")
             menu.exec(self.grid.viewport().mapToGlobal(position))
 
-        def _start_folder_conversion(self):
-            if self._thread is not None:
-                return
+        def _folder_scope_paths(self):
             if not self._folder or not os.path.isdir(self._folder):
-                self.status.setText("Choose a valid folder before converting to RAT.")
-                return
+                return []
             root = self._root_for_folder()
             extensions = root.get("extensions", ()) if root is not None else ()
-            paths = (
+            return (
                 files.scan_files(
                     self._folder,
                     extensions=extensions,
@@ -999,6 +1090,71 @@ if QtCore is not None:
                 if extensions
                 else []
             )
+
+        def _populate_lowres_menu(self, menu, paths, description):
+            paths = list(paths)
+            if not paths or self._thread is not None:
+                menu.setEnabled(False)
+                return
+            resolutions, errors = resize.probe_resolutions(paths)
+            widths = {path: dimensions[0] for path, dimensions in resolutions.items()}
+            rungs = resize.rungs_below_largest(widths.values())
+            if not rungs:
+                action = QAction("No lower standard rungs available", menu)
+                action.setEnabled(False)
+                menu.addAction(action)
+                menu.setEnabled(False)
+                if errors:
+                    self.status.setText(
+                        "Could not read {} texture resolution{}.".format(
+                            len(errors), "" if len(errors) == 1 else "s"
+                        )
+                    )
+                return
+            for width in rungs:
+                eligible, skipped = resize.partition_by_width(widths, width)
+                label = resize.rung_label(width).upper()
+                counts = "{} ({} resize, {} skip)".format(
+                    label, len(eligible), len(skipped)
+                )
+                if errors:
+                    counts += ", {} unknown".format(len(errors))
+                action = QAction(counts, menu)
+                action.triggered.connect(
+                    lambda _checked=False, values=paths, rung=width, scope=description: self._start_lowres(
+                        values, rung, scope
+                    )
+                )
+                menu.addAction(action)
+            if errors:
+                self.status.setText(
+                    "Read {} of {} resolutions; unreadable files will be reported by the job.".format(
+                        len(resolutions), len(paths)
+                    )
+                )
+
+        def _show_folder_lowres_menu(self):
+            if self._thread is not None:
+                return
+            paths = self._folder_scope_paths()
+            if not paths:
+                self.status.setText("No textures match the current low-res scope.")
+                return
+            menu = QtWidgets.QMenu(self.lowres_folder_button)
+            self._populate_lowres_menu(menu, paths, "folder texture")
+            menu.exec(
+                self.lowres_folder_button.mapToGlobal(
+                    QtCore.QPoint(0, self.lowres_folder_button.height())
+                )
+            )
+
+        def _start_folder_conversion(self):
+            if self._thread is not None:
+                return
+            if not self._folder or not os.path.isdir(self._folder):
+                self.status.setText("Choose a valid folder before converting to RAT.")
+                return
+            paths = self._folder_scope_paths()
             self._start_rat_conversion(paths, "folder texture")
 
         def _start_rat_conversion(self, paths, description):
@@ -1040,6 +1196,56 @@ if QtCore is not None:
             workers = min(len(paths), worker._workers)
             self.status.setText(
                 "Converting {} {}{} to RAT with {} worker{}…".format(
+                    len(paths),
+                    description,
+                    "" if len(paths) == 1 else "s",
+                    workers,
+                    "" if workers == 1 else "s",
+                )
+            )
+            thread.start()
+
+        def _start_lowres(self, paths, width, description):
+            if self._thread is not None:
+                return
+            paths = list(paths)
+            if not paths:
+                self.status.setText("No textures match the current low-res scope.")
+                return
+
+            thread = QtCore.QThread()
+            worker = LowResWorker(
+                paths,
+                width,
+                self._settings.get("lowres_output_mode", "alongside"),
+                bool(self._settings.get("lowres_also_rat", False)),
+                bool(self._settings.get("lowres_overwrite_existing", False)),
+                int(self._settings.get("thumbnail_workers", config.DEFAULT_THUMBNAIL_WORKERS)),
+            )
+            worker.moveToThread(thread)
+            thread.started.connect(worker.run)
+            worker.resized.connect(self._lowres_resized)
+            worker.skipped.connect(self._lowres_skipped)
+            worker.problem.connect(self._lowres_problem)
+            worker.progress.connect(self._job_progress)
+            worker.finished.connect(self._lowres_finished)
+            worker.finished.connect(thread.quit)
+            worker.finished.connect(worker.deleteLater)
+            thread.finished.connect(thread.deleteLater)
+            thread.finished.connect(lambda thread=thread: self._thread_finished(thread))
+            _ACTIVE_THREADS.add(thread)
+            self._thread = thread
+            self._worker = worker
+            self._job_kind = "lowres"
+            self._generation_errors = 0
+            self._conversion_skipped = 0
+            self.progress.setRange(0, len(paths))
+            self.progress.setValue(0)
+            self._set_job_controls(True)
+            workers = min(len(paths), worker._workers)
+            self.status.setText(
+                "Creating {} variants for {} {}{} with {} worker{}…".format(
+                    resize.rung_label(width).upper(),
                     len(paths),
                     description,
                     "" if len(paths) == 1 else "s",
@@ -1100,13 +1306,18 @@ if QtCore is not None:
         def _set_job_controls(self, running):
             self.generate_button.setEnabled(not running)
             self.convert_folder_button.setEnabled(not running)
+            self.lowres_folder_button.setEnabled(not running)
             self.cancel_button.setEnabled(running)
 
         def _cancel_job(self):
             if self._worker is not None:
                 self._worker.cancel()
                 self.cancel_button.setEnabled(False)
-                job = "thumbnail" if self._job_kind == "thumbnails" else "RAT"
+                job = {
+                    "thumbnails": "thumbnail",
+                    "rat": "RAT",
+                    "lowres": "low-res",
+                }.get(self._job_kind, "texture")
                 self.status.setText(
                     "Cancelling pending and active {} conversions…".format(job)
                 )
@@ -1165,6 +1376,36 @@ if QtCore is not None:
             else:
                 message = "RAT conversion complete: {} converted, {} skipped, {} failed".format(
                     converted, self._conversion_skipped, self._generation_errors
+                )
+            self._populate_grid()
+            self.status.setText(message)
+            self._set_job_controls(False)
+            self._worker = None
+            self._job_kind = None
+
+        def _lowres_resized(self, _source):
+            pass
+
+        def _lowres_skipped(self, _source, _target, _reason):
+            self._conversion_skipped += 1
+
+        def _lowres_problem(self, source, message):
+            self._generation_errors += 1
+            concise = message.splitlines()[-1] if message else "unknown error"
+            name = os.path.basename(source) if source else "low-res worker"
+            self.status.setText("Failed {}: {}".format(name, concise))
+
+        def _lowres_finished(self, cancelled):
+            completed = self.progress.value()
+            total = self.progress.maximum()
+            resized_count = max(
+                0, completed - self._generation_errors - self._conversion_skipped
+            )
+            if cancelled:
+                message = "Low-res creation cancelled ({}/{})".format(completed, total)
+            else:
+                message = "Low-res creation complete: {} resized, {} skipped, {} failed".format(
+                    resized_count, self._conversion_skipped, self._generation_errors
                 )
             self._populate_grid()
             self.status.setText(message)

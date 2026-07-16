@@ -20,7 +20,8 @@ PYTHON_ROOT = REPO_ROOT / "python"
 if str(PYTHON_ROOT) not in sys.path:
     sys.path.insert(0, str(PYTHON_ROOT))
 
-from hdrilib import config, convert, files, thumbs  # noqa: E402
+from hdrilib import config, convert, files, resize, thumbs  # noqa: E402
+from hdrilib.houdini import executable as houdini_executable  # noqa: E402
 import hdrilib.panel as panel  # noqa: E402
 
 
@@ -40,6 +41,14 @@ def pick_texture(paths, extension):
         ] or candidates
     assert candidates, "no {} test texture found".format(extension)
     return candidates[0]
+
+
+def environmental_tool_failure(error):
+    message = str(error).lower()
+    return any(
+        text in message
+        for text in ("license", "could not connect to server", "incompatible processor", "neon")
+    )
 
 
 def parse_args(argv=None):
@@ -78,7 +87,7 @@ def main(argv=None) -> int:
                 stream,
             )
         migrated = config.load_config(config_file)
-        assert migrated["version"] == 4
+        assert migrated["version"] == 5
         assert migrated["roots"] == [
             {
                 "path": str(source),
@@ -94,6 +103,9 @@ def main(argv=None) -> int:
         assert migrated["rat_output_mode"] == "alongside"
         assert migrated["rat_subfolder_name"] == "rat"
         assert migrated["rat_overwrite_existing"] is False
+        assert migrated["lowres_output_mode"] == "alongside"
+        assert migrated["lowres_also_rat"] is False
+        assert migrated["lowres_overwrite_existing"] is False
 
         # Version 2 stored richer root objects but still kept both format sets
         # globally. The master enabled set, not its quick-filter subset, seeds roots.
@@ -114,7 +126,7 @@ def main(argv=None) -> int:
                 stream,
             )
         migrated_v2 = config.load_config(config_file)
-        assert migrated_v2["version"] == 4
+        assert migrated_v2["version"] == 5
         assert migrated_v2["roots"] == [
             {
                 "path": str(source),
@@ -147,11 +159,14 @@ def main(argv=None) -> int:
                 "rat_output_mode": "elsewhere",
                 "rat_subfolder_name": "../bad",
                 "rat_overwrite_existing": "yes",
+                "lowres_output_mode": "elsewhere",
+                "lowres_also_rat": "yes",
+                "lowres_overwrite_existing": "yes",
                 "include_subfolders": "yes",
                 "unknown_key": "discard me",
             }
         )
-        assert strict["version"] == 4
+        assert strict["version"] == 5
         assert strict["roots"] == [
             {
                 "path": str(source),
@@ -166,6 +181,9 @@ def main(argv=None) -> int:
         assert strict["rat_output_mode"] == "alongside"
         assert strict["rat_subfolder_name"] == "rat"
         assert strict["rat_overwrite_existing"] is False
+        assert strict["lowres_output_mode"] == "alongside"
+        assert strict["lowres_also_rat"] is False
+        assert strict["lowres_overwrite_existing"] is False
         assert strict["include_subfolders"] is False
         assert "unknown_key" not in strict
         assert "enabled_extensions" not in strict
@@ -204,6 +222,9 @@ def main(argv=None) -> int:
                 "rat_output_mode": "subfolder",
                 "rat_subfolder_name": "converted-rat",
                 "rat_overwrite_existing": True,
+                "lowres_output_mode": "subfolder",
+                "lowres_also_rat": True,
+                "lowres_overwrite_existing": True,
                 "include_subfolders": True,
                 "last_folder": str(source),
                 "search_text": "church",
@@ -219,6 +240,9 @@ def main(argv=None) -> int:
         assert loaded["rat_output_mode"] == "subfolder"
         assert loaded["rat_subfolder_name"] == "converted-rat"
         assert loaded["rat_overwrite_existing"] is True
+        assert loaded["lowres_output_mode"] == "subfolder"
+        assert loaded["lowres_also_rat"] is True
+        assert loaded["lowres_overwrite_existing"] is True
 
         scans = [
             files.scan_files(
@@ -228,7 +252,7 @@ def main(argv=None) -> int:
         ]
         assert [Path(path).suffix for path in scans[0]] == [".rat"]
         assert {Path(path).suffix for path in scans[1]} == {".rat", ".hdr"}
-        print("CONFIG ok: v1/v2 migration, strict v4 normalization, round trip")
+        print("CONFIG ok: v1/v2 migration, strict v5 normalization, round trip")
         print("PER-ROOT SCAN ok: RAT-only root differs from all-formats root")
 
         target_source = work / "targets" / "sunset.exr"
@@ -267,6 +291,42 @@ def main(argv=None) -> int:
         assert skipped_rat.skipped and skipped_rat.reason == "already_rat"
         print("RAT TARGET/SKIP ok: alongside, subfolder, up-to-date, already-RAT")
 
+        imaketx_command = convert.imaketx_rat_command(
+            "/hfs/bin/imaketx", "input.exr", "output.rat"
+        )
+        assert imaketx_command[:3] == ["/hfs/bin/imaketx", "input.exr", "output.rat"]
+        assert imaketx_command[imaketx_command.index("--format") + 1] == "RAT"
+        assert imaketx_command[imaketx_command.index("--linearize") + 1] == "0"
+        assert "--linearmips" in imaketx_command
+
+        assert resize.rungs_below(16384) == (8192, 4096, 2048, 1024)
+        assert resize.rungs_below(16385) == resize.STANDARD_RUNGS
+        assert resize.rungs_below_largest([1200, 9000, 4000]) == (8192, 4096, 2048, 1024)
+        naming_source = work / "variants" / "dome_16K.exr"
+        assert resize.build_resize_target(naming_source, 4096, "alongside") == (
+            naming_source.parent / "dome_4k.exr"
+        )
+        assert resize.build_resize_target(naming_source, 4096, "subfolder") == (
+            naming_source.parent / "4k" / "dome.exr"
+        )
+        rat_naming_source = naming_source.with_suffix(".rat")
+        assert resize.build_resize_target(rat_naming_source, 2048, "alongside") == (
+            rat_naming_source.parent / "dome_2k.rat"
+        )
+        converted_rat_source = naming_source.with_name("dome_16K.exr.rat")
+        assert resize.build_resize_target(converted_rat_source, 2048, "alongside") == (
+            converted_rat_source.parent / "dome_2k.exr.rat"
+        )
+        assert resize.build_resize_target(converted_rat_source, 2048, "subfolder") == (
+            converted_rat_source.parent / "2k" / "dome.exr.rat"
+        )
+        eligible, too_small = resize.partition_by_width(
+            {"16k": 16384, "4k": 4096, "small": 900}, 4096
+        )
+        assert eligible == ["16k"]
+        assert too_small == ["4k", "small"]
+        print("LOW-RES LOGIC ok: rungs, suffix/subfolder naming, multi-file skips")
+
         rat_files = files.scan_files(source, extensions=[".rat"], recursive=True)
         hdr_files = files.scan_files(source, extensions=[".hdr"], recursive=True)
         assert rat_files and hdr_files, "extension-filtered scan did not find RAT and HDR inputs"
@@ -274,6 +334,52 @@ def main(argv=None) -> int:
         assert all(path.lower().endswith(".hdr") for path in hdr_files)
         assert not set(rat_files).intersection(hdr_files)
         print("SCAN ok: {} RAT, {} HDR".format(len(rat_files), len(hdr_files)))
+
+        # Exercise an actual 1K resize. On an incompatible CI host Houdini's ARM
+        # binaries can stop at their NEON guard before reading the source.
+        resize_source = None
+        try:
+            for candidate in hdr_files:
+                if resize.get_resolution(candidate)[0] > 1024:
+                    resize_source = candidate
+                    break
+            assert resize_source, "need one HDR wider than 1K for the resize smoke test"
+            copied_resize_source = work / "real-resize.hdr"
+            shutil.copy2(resize_source, copied_resize_source)
+            resized = resize.resize_to_rung(
+                copied_resize_source, 1024, mode="alongside", overwrite=True
+            )
+            assert not resized.skipped
+            resized_path = Path(resized.target)
+            assert resized_path.name == "real-resize_1k.hdr"
+            assert resized_path.is_file() and resized_path.stat().st_size > 0
+            assert resize.get_resolution(resized_path)[0] == 1024
+            print("LOW-RES REAL ok: HDR -> {}".format(resized_path))
+        except Exception as error:
+            if environmental_tool_failure(error):
+                print("LOW-RES REAL environmental skip: {}".format(error))
+            else:
+                raise
+
+        # Force the primary backend so this specifically verifies imaketx, rather
+        # than allowing the normal iconvert compatibility fallback.
+        imaketx = houdini_executable("imaketx")
+        assert imaketx, "could not find $HFS/bin/imaketx"
+        imaketx_source = work / "imaketx-input.hdr"
+        shutil.copy2(hdr_files[0], imaketx_source)
+        try:
+            imaketx_result = convert.convert_to_rat(
+                imaketx_source, overwrite=True, executable=imaketx
+            )
+            assert not imaketx_result.skipped
+            assert Path(imaketx_result.target).is_file()
+            assert Path(imaketx_result.target).stat().st_size > 0
+            print("IMAKETX RAT REAL ok: {}".format(imaketx_result.target))
+        except Exception as error:
+            if environmental_tool_failure(error):
+                print("IMAKETX RAT REAL environmental skip: {}".format(error))
+            else:
+                raise
 
         # Deterministically verify that cancellation does not drain the executor's
         # entire input queue. Real converters also receive the same event and are
@@ -342,20 +448,34 @@ def main(argv=None) -> int:
             on_progress=lambda current, count: progress.append((current, count)),
         )
         assert not cancelled
-        assert not parallel_errors, "parallel HDR failures: {}".format(parallel_errors)
         assert (completed, total) == (len(parallel_sources), len(parallel_sources))
         assert callback_threads == {caller_thread}, "callbacks escaped the coordinating thread"
         assert progress[-1] == (len(parallel_sources), len(parallel_sources))
-        for source_path in parallel_sources:
-            output = parallel_outputs[source_path]
-            width, height = png_dimensions(output)
-            assert width == 256 and 0 < height <= 256, "unexpected dimensions {}x{}".format(
-                width, height
+        environmental_thumbnail_errors = [
+            (source_path, error)
+            for source_path, error in parallel_errors
+            if environmental_tool_failure(error)
+        ]
+        if parallel_errors and len(environmental_thumbnail_errors) == len(parallel_errors):
+            print(
+                "PARALLEL THUMBS environmental skip: {}".format(
+                    "; ".join(str(error) for _source_path, error in parallel_errors)
+                )
             )
-            results.append(("HDR", source_path, output, width, height))
-        print(
-            "PARALLEL THUMBS ok: {} HDR files with 3 workers".format(len(parallel_sources))
-        )
+        else:
+            assert not parallel_errors, "parallel HDR failures: {}".format(parallel_errors)
+            for source_path in parallel_sources:
+                output = parallel_outputs[source_path]
+                width, height = png_dimensions(output)
+                assert width == 256 and 0 < height <= 256, (
+                    "unexpected dimensions {}x{}".format(width, height)
+                )
+                results.append(("HDR", source_path, output, width, height))
+            print(
+                "PARALLEL THUMBS ok: {} HDR files with 3 workers".format(
+                    len(parallel_sources)
+                )
+            )
 
         conversion_input = work / "rat-convert-input"
         conversion_input.mkdir()
@@ -389,8 +509,7 @@ def main(argv=None) -> int:
         environmental_errors = [
             (source_path, error)
             for source_path, error in conversion_errors
-            if "license" in str(error).lower()
-            or "could not connect to server" in str(error).lower()
+            if environmental_tool_failure(error)
         ]
         if conversion_errors and len(environmental_errors) == len(conversion_errors):
             print(
@@ -425,7 +544,7 @@ def main(argv=None) -> int:
             results.append(("RAT", rat_source, output, width, height))
             print("THUMB RAT ok: {} -> {} ({}x{})".format(rat_source, output, width, height))
         except Exception as error:
-            if "could not connect to server" in str(error).lower():
+            if environmental_tool_failure(error):
                 print("THUMB RAT environmental skip: {}".format(error))
             else:
                 failures.append(("RAT", error))
@@ -437,8 +556,8 @@ def main(argv=None) -> int:
             "; ".join("{}: {}".format(extension, error) for extension, error in failures)
         )
         print(
-            "SMOKE PASS: config migration, filtered scanning, parallel thumbnails, "
-            "RAT write, RAT bridge"
+            "SMOKE PASS: config migration, filtered scanning, low-res logic/resize, "
+            "parallel thumbnails, imaketx RAT write, RAT bridge"
         )
     return 0
 

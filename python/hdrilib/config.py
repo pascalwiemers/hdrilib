@@ -24,7 +24,7 @@ DEFAULT_EXTENSIONS = (
     ".tiff",
 )
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 DEFAULT_THUMBNAIL_WORKERS = min(8, os.cpu_count() or 1)
 _COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 
@@ -37,6 +37,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "rat_output_mode": "alongside",
     "rat_subfolder_name": "rat",
     "rat_overwrite_existing": False,
+    "lowres_output_mode": "alongside",
+    "lowres_also_rat": False,
+    "lowres_overwrite_existing": False,
     "include_subfolders": False,
     "last_folder": "",
     "search_text": "",
@@ -184,6 +187,15 @@ def normalise_config(data: Mapping[str, Any] | None) -> dict[str, Any]:
     rat_overwrite_existing = data.get("rat_overwrite_existing")
     if isinstance(rat_overwrite_existing, bool):
         result["rat_overwrite_existing"] = rat_overwrite_existing
+
+    lowres_output_mode = data.get("lowres_output_mode")
+    if lowres_output_mode in ("alongside", "subfolder"):
+        result["lowres_output_mode"] = lowres_output_mode
+
+    for key in ("lowres_also_rat", "lowres_overwrite_existing"):
+        value = data.get(key)
+        if isinstance(value, bool):
+            result[key] = value
 
     include_subfolders = data.get("include_subfolders")
     if isinstance(include_subfolders, bool):

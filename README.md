@@ -5,10 +5,11 @@ textures. It caches compact previews and assigns a texture to the selected Solar
 dome/rect light or OBJ environment light when you double-click a thumbnail. It can
 also batch-convert any enabled source texture format to Houdini `.rat` files.
 
-It has no dependencies beyond Houdini. Thumbnail conversion uses Houdini's own
-`$HFS/bin/hoiiotool`; Houdini's `iconvert` supplies the native RAT reader before the
-OpenImageIO resize/display-transform stage and batch-writes new RAT files. All user state lives in
-`~/.houdini_hdrilib` so it survives Houdini version upgrades.
+It has no dependencies beyond Houdini. Thumbnail conversion and low-resolution variants
+use Houdini's own `$HFS/bin/hoiiotool`; Houdini's `iconvert` supplies the native RAT
+reader when an OpenImageIO operation needs a float EXR bridge. Mipmapped RAT output uses
+`$HFS/bin/imaketx`, with `iconvert` retained as a compatibility fallback. All user state
+lives in `~/.houdini_hdrilib` so it survives Houdini version upgrades.
 
 ## Install with `install.py`
 
@@ -93,8 +94,8 @@ resolves relative to that directory.
    changing them immediately updates that root's Settings entry and scan results. This
    works for both root folders and their subfolders in Sidebar and Dropdown modes.
 4. Set the preview size and parallel worker count. The default worker count is the
-   smaller of 8 and the machine's CPU count. Thumbnail generation and RAT conversion
-   share this worker limit.
+   smaller of 8 and the machine's CPU count. Thumbnail generation, RAT conversion, and
+   low-resolution creation share this worker limit.
 5. Return to **Browse**, choose a location, then search by filename or toggle **Include
    subfolders**. Click **Generate thumbnails**; conversions run concurrently and previews
    appear as each finishes. **Cancel** promptly drops pending jobs and terminates active
@@ -111,9 +112,28 @@ resolves relative to that directory.
    collide. Existing targets at least as new as their sources are skipped unless
    **Overwrite existing** is enabled, and `.rat` inputs are always
    skipped. Conversion shares the thumbnail progress bar and Cancel button; only one
-   background batch can run at a time. The grid refreshes when a batch finishes. HDR
-   and EXR inputs are written as linear 32-bit float RATs to preserve dynamic range.
-7. Select a supported light and double-click a texture:
+   background batch can run at a time. The grid refreshes when a batch finishes.
+   `imaketx` writes a render-ready mip pyramid and automatic sRGB linearization is
+   disabled, preserving linear HDR/EXR values and their floating-point depth. If
+   `imaketx` is unavailable or fails, `iconvert` supplies the older flat RAT fallback.
+7. Create lower-resolution management copies from the standard **16K**, **8K**, **4K**,
+   **2K**, and **1K** width rungs:
+
+   - Select one or more thumbnails, right-click, open **Create Low-Res Versions**, and
+     choose a rung. The menu only shows rungs below the widest selection. Its counts
+     show how many files will resize and how many are already at or below that width.
+   - Click **Create low-res…** beside the folder RAT action to process the current
+     folder scope, honoring Formats and Include subfolders.
+
+   In **Low-Res Variants** settings, **Alongside source** creates names such as
+   `sky_4k.exr`; an existing trailing `_NNk` is replaced instead of stacked.
+   **Resolution subfolder** creates `4k/sky.exr`. Outputs keep the source format by
+   default. RAT sources are bridged through a temporary float EXR and returned as RAT;
+   **Also convert to .rat** keeps the native low-res copy and adds a mipmapped companion
+   such as `sky_4k.exr.rat`. Up-to-date outputs are skipped unless overwrite is enabled.
+   Resolution probes are cached by path and modification time. Batches use the shared
+   worker setting, progress bar, and Cancel button, and refresh the grid on completion.
+8. Select a supported light and double-click a texture:
 
    - Solaris dome/Karma dome/rect lights use the USD `inputs:texture:file` parameter.
    - OBJ `envlight` nodes use `env_map`.
@@ -121,9 +141,9 @@ resolves relative to that directory.
 Settings are stored in `~/.houdini_hdrilib/config.json`; cached PNGs are stored in
 `~/.houdini_hdrilib/thumbs/`. Cache keys include source path, modification time, file
 size, thumbnail size, and conversion recipe, so edited textures regenerate cleanly.
-The version-4 config stores each root's path, label, color, and extension set alongside
-the location mode, preview size, worker count, and RAT output choices. Existing
-version-1 through version-3 configs are migrated on load: each root receives the old
+The version-5 config stores each root's path, label, color, and extension set alongside
+the location mode, preview size, worker count, RAT output choices, and low-resolution
+defaults. Existing version-1 through version-4 configs are migrated on load: each root receives the old
 global `enabled_extensions`
 set, version-1 path strings become root objects, and obsolete global master/quick format
 fields are removed from the normalized config.
@@ -133,11 +153,13 @@ HDR highlights.
 
 ## Headless smoke test
 
-The smoke test checks strict version-4 normalization and version-1/version-2 migration,
+The smoke test checks strict version-5 normalization and version-1/version-2 migration,
 verifies different roots produce different results with RAT-only and all-format sets,
-recursively scans real `.rat` and `.hdr` inputs, imports the panel entry point, generates
-several real HDR previews in parallel, checks RAT target/skip behavior, converts two
-temporary HDR/EXR copies to RAT in parallel, and exercises the RAT-read bridge:
+checks low-res rung computation, naming and multi-file skip logic, recursively scans real
+`.rat` and `.hdr` inputs, imports the panel entry point, performs a real HDR-to-1K resize,
+generates several real HDR previews in parallel, forces one real `imaketx` RAT write,
+checks RAT target/skip behavior, converts two temporary inputs to RAT in parallel, and
+exercises the RAT-read bridge:
 
 ```sh
 HFS=/opt/hfs22.0 \
@@ -147,7 +169,8 @@ HFS=/opt/hfs22.0 \
 On macOS, use the `hython` in your Houdini install's `Resources/bin` directory. The
 library never embeds an installation path: it locates the tools through `hou.getenv("HFS")`
 or the inherited `$HFS` environment variable. A RAT-only `Could not connect to server`
-failure means `iconvert` could not reach the Houdini license server; the smoke test marks
-that specific RAT-read or RAT-write failure as environmental while still requiring all
-other checks to pass. RAT write smoke outputs live only inside the test's temporary
+failure means a Houdini tool could not reach the license server; a NEON/incompatible-CPU
+message means the installed Houdini binaries cannot execute on that test host. The smoke
+test marks those specific tool-environment failures while still requiring all pure-Python
+checks to pass. Resize and RAT-write smoke outputs live only inside the test's temporary
 directory, leaving source libraries and existing conversion caches untouched.

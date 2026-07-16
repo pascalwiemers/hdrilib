@@ -66,5 +66,7 @@ def run_subprocess(
                     return False, (stderr or stdout or "conversion timed out").strip()
     except (OSError, subprocess.SubprocessError) as error:
         return False, str(error)
-    detail = (stderr or stdout or "no diagnostic output").strip()
+    detail = "\n".join(
+        part.strip() for part in (stderr, stdout) if part and part.strip()
+    ) or "no diagnostic output"
     return process.returncode == 0, detail
