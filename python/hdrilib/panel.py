@@ -127,12 +127,13 @@ if QtCore is not None:
             super().__init__(parent)
             self._settings = config.load_config()
             self._folder = self._settings.get("last_folder", "")
+            self._folder_root = ""
             self._all_files = []
             self._worker = None
             self._thread = None
             self._generation_errors = 0
             self._format_actions = {}
-            self._master_extension_checks = {}
+            self._root_format_buttons = {}
             self._updating_roots = False
             self._syncing_location = False
             self._build_ui()
@@ -239,8 +240,10 @@ if QtCore is not None:
             roots_group = QtWidgets.QGroupBox("Root folders")
             roots_layout = QtWidgets.QVBoxLayout(roots_group)
             self.roots_list = QtWidgets.QTreeWidget()
-            self.roots_list.setColumnCount(3)
-            self.roots_list.setHeaderLabels(["Folder", "Display label", "Color"])
+            self.roots_list.setColumnCount(4)
+            self.roots_list.setHeaderLabels(
+                ["Folder", "Display label", "Color", "Formats"]
+            )
             self.roots_list.setRootIsDecorated(False)
             self.roots_list.setAlternatingRowColors(True)
             self.roots_list.setItemDelegate(RootSettingsDelegate(self.roots_list))
@@ -274,15 +277,6 @@ if QtCore is not None:
             location_layout.addWidget(self.dropdown_radio)
             location_layout.addStretch(1)
             options_row.addWidget(location_group)
-
-            formats_group = QtWidgets.QGroupBox("Available formats")
-            formats_layout = QtWidgets.QGridLayout(formats_group)
-            for index, extension in enumerate(config.DEFAULT_EXTENSIONS):
-                checkbox = QtWidgets.QCheckBox(extension)
-                checkbox.toggled.connect(self._master_formats_changed)
-                formats_layout.addWidget(checkbox, index // 4, index % 4)
-                self._master_extension_checks[extension] = checkbox
-            options_row.addWidget(formats_group, 1)
 
             thumbnail_group = QtWidgets.QGroupBox("Thumbnails")
             thumbnail_layout = QtWidgets.QFormLayout(thumbnail_group)
@@ -325,18 +319,7 @@ if QtCore is not None:
             self.include_subfolders.setChecked(bool(self._settings.get("include_subfolders")))
             self.include_subfolders.blockSignals(False)
 
-            master = set(self._settings.get("enabled_extensions", ()))
-            quick = set(self._settings.get("quick_filter_extensions", master))
-            for extension, checkbox in self._master_extension_checks.items():
-                checkbox.blockSignals(True)
-                checkbox.setChecked(extension in master)
-                checkbox.blockSignals(False)
-            for extension, action in self._format_actions.items():
-                action.blockSignals(True)
-                action.setVisible(extension in master)
-                action.setChecked(extension in master and extension in quick)
-                action.blockSignals(False)
-            self._update_format_button()
+            self._sync_browse_formats()
 
             self.thumbnail_size_spin.blockSignals(True)
             self.thumbnail_size_spin.setValue(int(self._settings.get("thumbnail_size", 256)))
@@ -360,7 +343,6 @@ if QtCore is not None:
             self._settings["last_folder"] = self._folder or ""
             self._settings["search_text"] = self.search.text()
             self._settings["include_subfolders"] = self.include_subfolders.isChecked()
-            self._settings["quick_filter_extensions"] = self._enabled_extensions()
             try:
                 self._settings = config.save_config(self._settings)
             except OSError as error:
@@ -371,6 +353,60 @@ if QtCore is not None:
 
         def _root_display_name(self, root):
             return root.get("label") or os.path.basename(root["path"]) or root["path"]
+
+        def _root_by_path(self, path):
+            return next(
+                (root for root in self._root_entries() if root["path"] == path),
+                None,
+            )
+
+        def _root_for_folder(self, folder=None):
+            folder = os.path.abspath(folder or self._folder) if folder or self._folder else ""
+            if not folder:
+                return None
+            hinted_root = self._root_by_path(self._folder_root)
+            if hinted_root is not None:
+                try:
+                    if os.path.commonpath([folder, hinted_root["path"]]) == hinted_root["path"]:
+                        return hinted_root
+                except (OSError, ValueError):
+                    pass
+            matches = []
+            for root in self._root_entries():
+                root_path = root["path"]
+                try:
+                    inside = os.path.commonpath([folder, root_path]) == root_path
+                except (OSError, ValueError):
+                    inside = False
+                if inside:
+                    matches.append(root)
+            return max(matches, key=lambda root: len(root["path"])) if matches else None
+
+        def _format_count_text(self, root):
+            return "Formats ({}/{})".format(
+                len(root.get("extensions", ())), len(config.DEFAULT_EXTENSIONS)
+            )
+
+        def _make_root_formats_button(self, root):
+            root_path = root["path"]
+            button = QtWidgets.QToolButton(self.roots_list)
+            button.setText(self._format_count_text(root))
+            button.setPopupMode(INSTANT_POPUP)
+            menu = QtWidgets.QMenu(button)
+            enabled = set(root.get("extensions", ()))
+            for extension in config.DEFAULT_EXTENSIONS:
+                action = QAction(extension, menu)
+                action.setCheckable(True)
+                action.setChecked(extension in enabled)
+                action.toggled.connect(
+                    lambda checked, path=root_path, value=extension: self._root_format_changed(
+                        path, value, checked
+                    )
+                )
+                menu.addAction(action)
+            button.setMenu(menu)
+            self._root_format_buttons[root_path] = button
+            return button
 
         def _color_icon(self, color):
             if not color:
@@ -387,13 +423,23 @@ if QtCore is not None:
                 selected_row = self.roots_list.indexOfTopLevelItem(self.roots_list.currentItem())
             self._updating_roots = True
             self.roots_list.clear()
+            self._root_format_buttons.clear()
             for root in self._root_entries():
                 item = QtWidgets.QTreeWidgetItem(
-                    self.roots_list, [root["path"], root.get("label", ""), root.get("color", "")]
+                    self.roots_list,
+                    [
+                        root["path"],
+                        root.get("label", ""),
+                        root.get("color", ""),
+                        self._format_count_text(root),
+                    ],
                 )
                 item.setToolTip(0, root["path"])
                 item.setFlags(item.flags() | ITEM_IS_EDITABLE)
                 item.setIcon(2, self._color_icon(root.get("color", "")))
+                self.roots_list.setItemWidget(
+                    item, 3, self._make_root_formats_button(root)
+                )
             self._updating_roots = False
             count = self.roots_list.topLevelItemCount()
             if count:
@@ -423,7 +469,11 @@ if QtCore is not None:
                 return
             if column != 1:
                 root = self._root_entries()[row]
-                expected = root["path"] if column == 0 else root.get("color", "")
+                expected = {
+                    0: root["path"],
+                    2: root.get("color", ""),
+                    3: self._format_count_text(root),
+                }.get(column, "")
                 self._updating_roots = True
                 item.setText(column, expected)
                 self._updating_roots = False
@@ -442,6 +492,27 @@ if QtCore is not None:
                 self.roots_list.setCurrentItem(item)
                 self._choose_root_color()
 
+        def _root_format_changed(self, root_path, extension, checked):
+            root = self._root_by_path(root_path)
+            if root is None:
+                return
+            enabled = set(root.get("extensions", ()))
+            if checked:
+                enabled.add(extension)
+            else:
+                enabled.discard(extension)
+            root["extensions"] = [
+                value for value in config.DEFAULT_EXTENSIONS if value in enabled
+            ]
+            button = self._root_format_buttons.get(root_path)
+            if button is not None:
+                button.setText(self._format_count_text(root))
+            is_current = self._root_for_folder() is root
+            self._save()
+            if is_current:
+                self._sync_browse_formats()
+                self._populate_grid()
+
         def _add_root(self):
             start = self._folder or str(Path.home())
             selected = QtWidgets.QFileDialog.getExistingDirectory(self, "Add HDRI folder", start)
@@ -454,11 +525,19 @@ if QtCore is not None:
                 None,
             )
             if existing is None:
-                roots.append({"path": selected, "label": "", "color": ""})
+                roots.append(
+                    {
+                        "path": selected,
+                        "label": "",
+                        "color": "",
+                        "extensions": list(config.DEFAULT_EXTENSIONS),
+                    }
+                )
                 row = len(roots) - 1
             else:
                 row = existing
             self._folder = selected
+            self._folder_root = selected
             self._save()
             self._rebuild_root_settings(row)
             self._rebuild_locations()
@@ -472,6 +551,7 @@ if QtCore is not None:
             removed = roots.pop(row)["path"]
             if self._folder == removed or self._folder.startswith(removed + os.sep):
                 self._folder = roots[0]["path"] if roots else ""
+                self._folder_root = roots[0]["path"] if roots else ""
             self._save()
             self._rebuild_root_settings(min(row, len(roots) - 1))
             self._rebuild_locations()
@@ -539,13 +619,22 @@ if QtCore is not None:
                 )
 
         def _add_combo_folder(self, path, label, root, seen_paths):
-            if path in seen_paths:
+            key = (root["path"], path)
+            if key in seen_paths:
                 return
-            seen_paths.add(path)
+            seen_paths.add(key)
             self.location_combo.addItem(self._color_icon(root.get("color", "")), label, path)
             index = self.location_combo.count() - 1
             self.location_combo.setItemData(index, path, TOOLTIP_ROLE)
             self.location_combo.setItemData(index, root["path"], ROOT_ROLE)
+
+        def _combo_folder_index(self, path, root_path=""):
+            for index in range(self.location_combo.count()):
+                if self.location_combo.itemData(index, USER_ROLE) != path:
+                    continue
+                if not root_path or self.location_combo.itemData(index, ROOT_ROLE) == root_path:
+                    return index
+            return -1
 
         def _rebuild_locations(self):
             self._syncing_location = True
@@ -555,6 +644,11 @@ if QtCore is not None:
             self.location_combo.clear()
             selected_item = None
             seen_combo_paths = set()
+            preferred_root_path = self._folder_root
+            if self._folder and not preferred_root_path:
+                preferred_root = self._root_for_folder(self._folder)
+                if preferred_root is not None:
+                    preferred_root_path = preferred_root["path"]
             for root in self._root_entries():
                 path = root["path"]
                 if not os.path.isdir(path):
@@ -570,11 +664,14 @@ if QtCore is not None:
                 if self._folder == path:
                     selected_item = item
 
-            if self._folder and selected_item is None:
+            if self._folder:
                 iterator = QtWidgets.QTreeWidgetItemIterator(self.folder_tree)
                 while iterator.value():
                     item = iterator.value()
-                    if item.data(0, USER_ROLE) == self._folder:
+                    if item.data(0, USER_ROLE) == self._folder and (
+                        not preferred_root_path
+                        or item.data(0, ROOT_ROLE) == preferred_root_path
+                    ):
                         selected_item = item
                         break
                     iterator += 1
@@ -582,44 +679,64 @@ if QtCore is not None:
                 selected_item = self.folder_tree.topLevelItem(0)
                 self._folder = selected_item.data(0, USER_ROLE)
             if selected_item is not None:
+                self._folder_root = selected_item.data(0, ROOT_ROLE)
                 self.folder_tree.setCurrentItem(selected_item)
                 self.folder_tree.scrollToItem(selected_item)
-            combo_index = self.location_combo.findData(self._folder, USER_ROLE)
+            else:
+                self._folder_root = ""
+            combo_index = self._combo_folder_index(self._folder, self._folder_root)
             if combo_index >= 0:
                 self.location_combo.setCurrentIndex(combo_index)
             self.folder_tree.blockSignals(False)
             self.location_combo.blockSignals(False)
             self._syncing_location = False
+            self._sync_browse_formats()
             self._populate_grid()
 
         def _folder_changed(self, current, _previous):
             if current is None or self._syncing_location:
                 return
-            self._set_folder(current.data(0, USER_ROLE), sync_tree=False)
+            self._set_folder(
+                current.data(0, USER_ROLE),
+                root_path=current.data(0, ROOT_ROLE),
+                sync_tree=False,
+            )
 
         def _dropdown_folder_changed(self, index):
             if index < 0 or self._syncing_location:
                 return
-            self._set_folder(self.location_combo.itemData(index, USER_ROLE), sync_combo=False)
+            self._set_folder(
+                self.location_combo.itemData(index, USER_ROLE),
+                root_path=self.location_combo.itemData(index, ROOT_ROLE),
+                sync_combo=False,
+            )
 
-        def _set_folder(self, path, sync_tree=True, sync_combo=True):
+        def _set_folder(self, path, root_path="", sync_tree=True, sync_combo=True):
             if not path:
                 return
             self._folder = path
+            self._folder_root = root_path
+            if not self._folder_root:
+                root = self._root_for_folder(path)
+                self._folder_root = root["path"] if root is not None else ""
             self._syncing_location = True
             if sync_combo:
-                index = self.location_combo.findData(path, USER_ROLE)
+                index = self._combo_folder_index(path, self._folder_root)
                 if index >= 0:
                     self.location_combo.setCurrentIndex(index)
             if sync_tree:
                 iterator = QtWidgets.QTreeWidgetItemIterator(self.folder_tree)
                 while iterator.value():
                     item = iterator.value()
-                    if item.data(0, USER_ROLE) == path:
+                    if item.data(0, USER_ROLE) == path and (
+                        not self._folder_root
+                        or item.data(0, ROOT_ROLE) == self._folder_root
+                    ):
                         self.folder_tree.setCurrentItem(item)
                         break
                     iterator += 1
             self._syncing_location = False
+            self._sync_browse_formats()
             self._save()
             self._populate_grid()
 
@@ -642,44 +759,45 @@ if QtCore is not None:
             if save:
                 self._save()
 
-        def _enabled_extensions(self):
-            master = set(self._settings.get("enabled_extensions", ()))
+        def _checked_extensions(self):
             return [
                 extension
                 for extension, action in self._format_actions.items()
-                if extension in master and action.isChecked()
+                if action.isChecked()
             ]
 
-        def _update_format_button(self):
-            selected = len(self._enabled_extensions())
-            available = len(self._settings.get("enabled_extensions", ()))
-            self.format_button.setText("Formats ({}/{})".format(selected, available))
-            self.format_button.setEnabled(bool(available))
-
-        def _formats_changed(self, _checked=False):
-            self._update_format_button()
-            self._save()
-            self._populate_grid()
-
-        def _master_formats_changed(self, _checked=False):
-            old_master = set(self._settings.get("enabled_extensions", ()))
-            new_master = {
-                extension
-                for extension, checkbox in self._master_extension_checks.items()
-                if checkbox.isChecked()
-            }
-            quick = set(self._enabled_extensions())
-            quick = (quick & new_master) | (new_master - old_master)
-            self._settings["enabled_extensions"] = [
-                extension for extension in config.DEFAULT_EXTENSIONS if extension in new_master
-            ]
+        def _sync_browse_formats(self):
+            root = self._root_for_folder()
+            enabled = set(root.get("extensions", ())) if root is not None else set()
             for extension, action in self._format_actions.items():
                 action.blockSignals(True)
-                action.setVisible(extension in new_master)
-                action.setChecked(extension in quick)
+                action.setVisible(True)
+                action.setChecked(extension in enabled)
                 action.blockSignals(False)
+            self.format_button.setToolTip(
+                "Formats for {}".format(self._root_display_name(root)) if root else ""
+            )
+            self._update_format_button()
+
+        def _update_format_button(self):
+            selected = len(self._checked_extensions())
+            available = len(config.DEFAULT_EXTENSIONS)
+            self.format_button.setText("Formats ({}/{})".format(selected, available))
+            self.format_button.setEnabled(self._root_for_folder() is not None)
+
+        def _formats_changed(self, _checked=False):
+            root = self._root_for_folder()
+            if root is None:
+                self._sync_browse_formats()
+                return
+            root_path = root["path"]
+            root["extensions"] = self._checked_extensions()
             self._update_format_button()
             self._save()
+            button = self._root_format_buttons.get(root_path)
+            saved_root = self._root_by_path(root_path)
+            if button is not None and saved_root is not None:
+                button.setText(self._format_count_text(saved_root))
             self._populate_grid()
 
         def _thumbnail_settings_changed(self, _value=None):
@@ -708,7 +826,8 @@ if QtCore is not None:
                 if not self._root_entries():
                     self.status.setText("Add an HDRI root in Settings to begin.")
                 return
-            extensions = self._enabled_extensions()
+            root = self._root_for_folder()
+            extensions = root.get("extensions", ()) if root is not None else ()
             self._all_files = (
                 files.scan_files(
                     self._folder,

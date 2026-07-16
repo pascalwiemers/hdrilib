@@ -77,18 +77,60 @@ def main(argv=None) -> int:
                 stream,
             )
         migrated = config.load_config(config_file)
-        assert migrated["version"] == 2
-        assert migrated["roots"] == [{"path": str(source), "label": "", "color": ""}]
+        assert migrated["version"] == 3
+        assert migrated["roots"] == [
+            {
+                "path": str(source),
+                "label": "",
+                "color": "",
+                "extensions": [".rat", ".hdr"],
+            }
+        ]
         assert migrated["location_ui_mode"] == "sidebar"
-        assert migrated["enabled_extensions"] == [".rat", ".hdr"]
-        assert migrated["quick_filter_extensions"] == [".rat", ".hdr"]
+        assert "enabled_extensions" not in migrated
+        assert "quick_filter_extensions" not in migrated
         assert migrated["thumbnail_workers"] == config.DEFAULT_THUMBNAIL_WORKERS
+
+        # Version 2 stored richer root objects but still kept both format sets
+        # globally. The master enabled set, not its quick-filter subset, seeds roots.
+        with config_file.open("w", encoding="utf-8") as stream:
+            json.dump(
+                {
+                    "version": 2,
+                    "roots": [
+                        {
+                            "path": str(source),
+                            "label": "Legacy studio",
+                            "color": "#123456",
+                        }
+                    ],
+                    "enabled_extensions": ["EXR", "RAT"],
+                    "quick_filter_extensions": ["RAT"],
+                },
+                stream,
+            )
+        migrated_v2 = config.load_config(config_file)
+        assert migrated_v2["version"] == 3
+        assert migrated_v2["roots"] == [
+            {
+                "path": str(source),
+                "label": "Legacy studio",
+                "color": "#123456",
+                "extensions": [".exr", ".rat"],
+            }
+        ]
 
         strict = config.normalise_config(
             {
-                "version": 999,
+                "version": 3,
                 "roots": [
-                    {"path": str(source), "label": "  Studio  ", "color": "#A1B2C3"},
+                    {
+                        "path": str(source),
+                        "label": "  Studio  ",
+                        "color": "#A1B2C3",
+                        "extensions": ["EXR", ".rat", ".not-real", 42],
+                        "unknown_root_key": True,
+                    },
                     str(source),
                     {"path": 12, "label": "bad", "color": "red"},
                     "",
@@ -102,30 +144,51 @@ def main(argv=None) -> int:
                 "unknown_key": "discard me",
             }
         )
-        assert strict["version"] == 2
+        assert strict["version"] == 3
         assert strict["roots"] == [
-            {"path": str(source), "label": "Studio", "color": "#a1b2c3"}
+            {
+                "path": str(source),
+                "label": "Studio",
+                "color": "#a1b2c3",
+                "extensions": [".exr", ".rat"],
+            }
         ]
         assert strict["location_ui_mode"] == "sidebar"
-        assert strict["enabled_extensions"] == [".exr", ".rat"]
-        assert strict["quick_filter_extensions"] == [".rat"]
         assert strict["thumbnail_size"] == 64
         assert strict["thumbnail_workers"] == 64
         assert strict["include_subfolders"] is False
         assert "unknown_key" not in strict
+        assert "enabled_extensions" not in strict
+        assert "quick_filter_extensions" not in strict
         assert (
             config.normalise_config({"thumbnail_workers": True})["thumbnail_workers"]
             == config.DEFAULT_THUMBNAIL_WORKERS
         )
 
+        rat_root = work / "rat-root"
+        all_root = work / "all-root"
+        rat_root.mkdir()
+        all_root.mkdir()
+        for root in (rat_root, all_root):
+            (root / "sky.rat").touch()
+            (root / "sky.hdr").touch()
+
         saved = config.save_config(
             {
                 "roots": [
-                    {"path": str(source), "label": "Test HDRIs", "color": "#336699"}
+                    {
+                        "path": str(rat_root),
+                        "label": "RAT only",
+                        "color": "#336699",
+                        "extensions": ["RAT"],
+                    },
+                    {
+                        "path": str(all_root),
+                        "label": "All formats",
+                        "color": "",
+                    },
                 ],
                 "location_ui_mode": "dropdown",
-                "enabled_extensions": ["RAT", "HDR"],
-                "quick_filter_extensions": ["RAT"],
                 "thumbnail_size": 256,
                 "thumbnail_workers": 3,
                 "include_subfolders": True,
@@ -136,11 +199,21 @@ def main(argv=None) -> int:
         )
         loaded = config.load_config(config_file)
         assert loaded == saved, "config save/load round trip changed data"
-        assert loaded["roots"][0]["label"] == "Test HDRIs"
+        assert loaded["roots"][0]["label"] == "RAT only"
         assert loaded["roots"][0]["color"] == "#336699"
-        assert loaded["enabled_extensions"] == [".rat", ".hdr"]
-        assert loaded["quick_filter_extensions"] == [".rat"]
-        print("CONFIG ok: v1 migration, strict v2 normalization, round trip")
+        assert loaded["roots"][0]["extensions"] == [".rat"]
+        assert loaded["roots"][1]["extensions"] == list(config.DEFAULT_EXTENSIONS)
+
+        scans = [
+            files.scan_files(
+                root["path"], extensions=root["extensions"], recursive=True
+            )
+            for root in loaded["roots"]
+        ]
+        assert [Path(path).suffix for path in scans[0]] == [".rat"]
+        assert {Path(path).suffix for path in scans[1]} == {".rat", ".hdr"}
+        print("CONFIG ok: v1/v2 migration, strict v3 normalization, round trip")
+        print("PER-ROOT SCAN ok: RAT-only root differs from all-formats root")
 
         rat_files = files.scan_files(source, extensions=[".rat"], recursive=True)
         hdr_files = files.scan_files(source, extensions=[".hdr"], recursive=True)

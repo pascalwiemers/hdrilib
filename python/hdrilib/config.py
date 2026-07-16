@@ -24,7 +24,7 @@ DEFAULT_EXTENSIONS = (
     ".tiff",
 )
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DEFAULT_THUMBNAIL_WORKERS = min(8, os.cpu_count() or 1)
 _COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 
@@ -32,8 +32,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "version": SCHEMA_VERSION,
     "roots": [],
     "location_ui_mode": "sidebar",
-    "enabled_extensions": list(DEFAULT_EXTENSIONS),
-    "quick_filter_extensions": list(DEFAULT_EXTENSIONS),
     "thumbnail_size": 256,
     "thumbnail_workers": DEFAULT_THUMBNAIL_WORKERS,
     "include_subfolders": False,
@@ -70,13 +68,16 @@ def _normalise_extension(value: object) -> str | None:
     return value if value.startswith(".") else "." + value
 
 
-def _normalise_root(value: object) -> dict[str, str] | None:
-    """Return one strict schema-v2 root entry, accepting a v1 path string."""
+def _normalise_root(
+    value: object, extension_fallback: list[str]
+) -> dict[str, Any] | None:
+    """Return one strict current root entry, accepting a v1 path string."""
 
     if isinstance(value, (str, os.PathLike)):
         raw_path = os.fspath(value)
         label = ""
         color = ""
+        extensions = list(extension_fallback)
     elif isinstance(value, Mapping):
         raw_path = value.get("path")
         if not isinstance(raw_path, (str, os.PathLike)):
@@ -89,6 +90,9 @@ def _normalise_root(value: object) -> dict[str, str] | None:
             if isinstance(raw_color, str) and _COLOR_RE.match(raw_color)
             else ""
         )
+        extensions = _normalise_extensions(
+            value.get("extensions"), extension_fallback
+        )
     else:
         return None
 
@@ -98,6 +102,7 @@ def _normalise_root(value: object) -> dict[str, str] | None:
         "path": os.path.abspath(os.path.expanduser(os.fspath(raw_path))),
         "label": label,
         "color": color,
+        "extensions": extensions,
     }
 
 
@@ -115,32 +120,36 @@ def _normalise_extensions(values: object, fallback: list[str]) -> list[str]:
 def normalise_config(data: Mapping[str, Any] | None) -> dict[str, Any]:
     """Migrate, validate, and return only the current schema's known fields.
 
-    Version-1 root strings are accepted deliberately. All other malformed values
-    are discarded or replaced with bounded defaults, and unknown keys never leak
-    into the saved representation.
+    Version-1 root strings and version-2 root objects are accepted deliberately.
+    All other malformed values are discarded or replaced with bounded defaults,
+    and unknown keys never leak into the saved representation.
     """
 
     result = copy.deepcopy(DEFAULT_CONFIG)
     if not isinstance(data, Mapping):
         return result
 
+    source_version = data.get("version")
+    legacy_extensions = list(DEFAULT_EXTENSIONS)
+    if (
+        isinstance(source_version, int)
+        and not isinstance(source_version, bool)
+        and source_version in (1, 2)
+    ):
+        legacy_extensions = _normalise_extensions(
+            data.get("enabled_extensions"), legacy_extensions
+        )
+
     roots = data.get("roots")
     if isinstance(roots, (list, tuple)):
         clean_roots = []
         seen_paths = set()
         for root in roots:
-            clean_root = _normalise_root(root)
+            clean_root = _normalise_root(root, legacy_extensions)
             if clean_root and clean_root["path"] not in seen_paths:
                 seen_paths.add(clean_root["path"])
                 clean_roots.append(clean_root)
         result["roots"] = clean_roots
-
-    enabled = _normalise_extensions(
-        data.get("enabled_extensions"), result["enabled_extensions"]
-    )
-    result["enabled_extensions"] = enabled
-    quick = _normalise_extensions(data.get("quick_filter_extensions"), enabled)
-    result["quick_filter_extensions"] = [value for value in quick if value in enabled]
 
     mode = data.get("location_ui_mode")
     if mode in ("sidebar", "dropdown"):
