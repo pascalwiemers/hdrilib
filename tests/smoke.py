@@ -202,6 +202,7 @@ def main(argv=None) -> int:
                 "label": "",
                 "color": "",
                 "extensions": [".rat", ".hdr"],
+                "include_in_all": True,
             }
         ]
         assert migrated["location_ui_mode"] == "sidebar"
@@ -243,6 +244,7 @@ def main(argv=None) -> int:
                 "label": "Legacy studio",
                 "color": "#123456",
                 "extensions": [".exr", ".rat"],
+                "include_in_all": True,
             }
         ]
 
@@ -285,6 +287,7 @@ def main(argv=None) -> int:
                 "label": "Studio",
                 "color": "#a1b2c3",
                 "extensions": [".exr", ".rat"],
+                "include_in_all": True,
             }
         ]
         assert strict["location_ui_mode"] == "sidebar"

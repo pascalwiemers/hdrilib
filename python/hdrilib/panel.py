@@ -75,6 +75,9 @@ if QtCore is not None:
     def _enum_value(value):
         return getattr(value, "value", value)
 
+    # Virtual location aggregating every included library root in the browser.
+    ALL_HDRI = "::all-hdris::"
+
     USER_ROLE = _enum(QtCore.Qt, "ItemDataRole", "UserRole")
     TOOLTIP_ROLE = _enum(QtCore.Qt, "ItemDataRole", "ToolTipRole")
     ROOT_ROLE = _enum_value(USER_ROLE) + 1
@@ -833,6 +836,15 @@ if QtCore is not None:
                 widths[os.path.abspath(path)] = value[0] if value is not None else None
             return paths, widths, prepare.sensible_rungs(paths, dimensions)
 
+        def _set_root_include_in_all(self, root_path, included):
+            root = self._root_by_path(root_path)
+            if root is None:
+                return
+            root["include_in_all"] = bool(included)
+            self._save()
+            if self._folder == ALL_HDRI:
+                self._populate_grid()
+
         def _focus_root_formats(self, root_path):
             root = self._root_by_path(root_path)
             if root is None:
@@ -962,6 +974,15 @@ if QtCore is not None:
                 lowres_menu.menuAction().setToolTip(tooltip)
                 prepare_action.setToolTip(tooltip)
             menu.addSeparator()
+            include_action = QAction('Include in "All HDRIs"', menu)
+            include_action.setCheckable(True)
+            include_action.setChecked(root.get("include_in_all", True))
+            include_action.toggled.connect(
+                lambda checked, root_path=root["path"]: self._set_root_include_in_all(
+                    root_path, checked
+                )
+            )
+            menu.addAction(include_action)
             edit_formats = QAction("Edit Formats…", menu)
             edit_formats.triggered.connect(
                 lambda _checked=False, root_path=root["path"]: self._focus_root_formats(
@@ -1154,23 +1175,71 @@ if QtCore is not None:
             if not selected:
                 return
             selected = os.path.abspath(selected)
+            additions = [selected]
+            try:
+                subfolders = sorted(
+                    (
+                        entry.path
+                        for entry in os.scandir(selected)
+                        if entry.is_dir(follow_symlinks=False)
+                        and files._wanted_directory(entry.name)
+                    ),
+                    key=str.lower,
+                )
+            except OSError:
+                subfolders = []
+            if subfolders:
+                box = QtWidgets.QMessageBox(self)
+                box.setWindowTitle("Add HDRI folder")
+                box.setText(
+                    "{} contains {} subfolder{}.".format(
+                        os.path.basename(selected) or selected,
+                        len(subfolders),
+                        "" if len(subfolders) == 1 else "s",
+                    )
+                )
+                box.setInformativeText("Add them as separate library entries?")
+                accept_role = _enum(QtWidgets.QMessageBox, "ButtonRole", "AcceptRole")
+                single = box.addButton("This folder only", accept_role)
+                each = box.addButton(
+                    "Each subfolder ({})".format(len(subfolders)), accept_role
+                )
+                cancel = box.addButton(
+                    _enum(QtWidgets.QMessageBox, "StandardButton", "Cancel")
+                )
+                box.setDefaultButton(single)
+                box.exec()
+                if box.clickedButton() is cancel:
+                    return
+                if box.clickedButton() is each:
+                    additions = subfolders
             roots = self._root_entries()
-            existing = next(
-                (index for index, root in enumerate(roots) if root["path"] == selected),
-                None,
-            )
-            if existing is None:
+            known = {root["path"] for root in roots}
+            row = None
+            for path in additions:
+                if path in known:
+                    if row is None:
+                        row = next(
+                            index
+                            for index, root in enumerate(roots)
+                            if root["path"] == path
+                        )
+                    continue
                 roots.append(
                     {
-                        "path": selected,
+                        "path": path,
                         "label": "",
                         "color": "",
                         "extensions": list(config.DEFAULT_EXTENSIONS),
+                        "include_in_all": True,
                     }
                 )
-                row = len(roots) - 1
-            else:
-                row = existing
+                known.add(path)
+                if row is None:
+                    row = len(roots) - 1
+            selected = additions[0]
+            if row is None:
+                row = 0
             self._folder = selected
             self._folder_root = selected
             self._save()
@@ -1229,7 +1298,8 @@ if QtCore is not None:
                     (
                         entry
                         for entry in os.scandir(path)
-                        if entry.is_dir(follow_symlinks=False) and not entry.name.startswith(".")
+                        if entry.is_dir(follow_symlinks=False)
+                        and files._wanted_directory(entry.name)
                     ),
                     key=lambda entry: entry.name.lower(),
                 )
@@ -1279,6 +1349,17 @@ if QtCore is not None:
             self.location_combo.clear()
             selected_item = None
             seen_combo_paths = set()
+            if self._root_entries():
+                all_item = QtWidgets.QTreeWidgetItem(self.folder_tree, ["All HDRIs"])
+                all_item.setToolTip(0, "Every texture from included library roots")
+                all_item.setData(0, USER_ROLE, ALL_HDRI)
+                all_item.setData(0, ROOT_ROLE, ALL_HDRI)
+                self.location_combo.addItem("All HDRIs", ALL_HDRI)
+                self.location_combo.setItemData(
+                    self.location_combo.count() - 1, ALL_HDRI, ROOT_ROLE
+                )
+                if self._folder == ALL_HDRI:
+                    selected_item = all_item
             preferred_root_path = self._folder_root
             if self._folder and not preferred_root_path:
                 preferred_root = self._root_for_folder(self._folder)
@@ -1299,7 +1380,7 @@ if QtCore is not None:
                 if self._folder == path:
                     selected_item = item
 
-            if self._folder:
+            if self._folder and selected_item is None:
                 iterator = QtWidgets.QTreeWidgetItemIterator(self.folder_tree)
                 while iterator.value():
                     item = iterator.value()
@@ -1311,7 +1392,10 @@ if QtCore is not None:
                         break
                     iterator += 1
             if selected_item is None and self.folder_tree.topLevelItemCount():
-                selected_item = self.folder_tree.topLevelItem(0)
+                # Prefer the first real root over the aggregate view so a fresh
+                # session does not start with a full multi-root scan.
+                index = 1 if self.folder_tree.topLevelItemCount() > 1 else 0
+                selected_item = self.folder_tree.topLevelItem(index)
                 self._folder = selected_item.data(0, USER_ROLE)
             if selected_item is not None:
                 self._folder_root = selected_item.data(0, ROOT_ROLE)
@@ -1489,24 +1573,40 @@ if QtCore is not None:
             self._rebuild_locations()
             self.status.setText("Folder list refreshed.")
 
+        def _all_hdri_paths(self):
+            found = set()
+            for root in self._root_entries():
+                if not root.get("include_in_all", True):
+                    continue
+                extensions = root.get("extensions", ())
+                if not extensions or not os.path.isdir(root["path"]):
+                    continue
+                found.update(
+                    files.scan_files(root["path"], extensions=extensions, recursive=True)
+                )
+            return sorted(found, key=lambda value: (os.path.basename(value).lower(), value))
+
         def _populate_grid(self):
             self.grid.clear()
-            if not self._folder or not os.path.isdir(self._folder):
+            if self._folder == ALL_HDRI:
+                self._all_files = self._all_hdri_paths()
+            elif not self._folder or not os.path.isdir(self._folder):
                 self._all_files = []
                 if not self._root_entries():
                     self.status.setText("Add an HDRI root in Settings to begin.")
                 return
-            root = self._root_for_folder()
-            extensions = root.get("extensions", ()) if root is not None else ()
-            self._all_files = (
-                files.scan_files(
-                    self._folder,
-                    extensions=extensions,
-                    recursive=self.include_subfolders.isChecked(),
+            else:
+                root = self._root_for_folder()
+                extensions = root.get("extensions", ()) if root is not None else ()
+                self._all_files = (
+                    files.scan_files(
+                        self._folder,
+                        extensions=extensions,
+                        recursive=self.include_subfolders.isChecked(),
+                    )
+                    if extensions
+                    else []
                 )
-                if extensions
-                else []
-            )
             query = self.search.text().strip().lower()
             visible = [path for path in self._all_files if query in os.path.basename(path).lower()]
             fallback_icon = self.style().standardIcon(STANDARD_FILE_ICON)
@@ -1575,6 +1675,8 @@ if QtCore is not None:
             menu.exec(self.grid.viewport().mapToGlobal(position))
 
         def _folder_scope_paths(self):
+            if self._folder == ALL_HDRI:
+                return self._all_hdri_paths()
             if not self._folder or not os.path.isdir(self._folder):
                 return []
             root = self._root_for_folder()

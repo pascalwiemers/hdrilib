@@ -90,6 +90,7 @@ def _normalise_root(
         label = ""
         color = ""
         extensions = list(extension_fallback)
+        include_in_all = True
     elif isinstance(value, Mapping):
         raw_path = value.get("path")
         if not isinstance(raw_path, (str, os.PathLike)):
@@ -105,6 +106,7 @@ def _normalise_root(
         extensions = _normalise_extensions(
             value.get("extensions"), extension_fallback
         )
+        include_in_all = value.get("include_in_all") is not False
     else:
         return None
 
@@ -115,6 +117,7 @@ def _normalise_root(
         "label": label,
         "color": color,
         "extensions": extensions,
+        "include_in_all": include_in_all,
     }
 
 
