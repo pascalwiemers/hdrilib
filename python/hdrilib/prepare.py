@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Sequence
 
-from . import convert, files, resize
+from . import config, convert, files, resize
 
 
 PREPARE_RUNGS = (8192, 4096, 2048, 1024)
@@ -57,6 +57,14 @@ class PipelineSummary:
     failed: int = 0
 
 
+@dataclass(frozen=True)
+class RootScanClassification:
+    """Explain why a filtered Settings-root action has no convertible input."""
+
+    state: str
+    hidden_count: int = 0
+
+
 def _path_key(path: str | os.PathLike[str]) -> str:
     return os.path.normcase(os.path.abspath(os.path.expanduser(os.fspath(path))))
 
@@ -87,6 +95,32 @@ def scan_root(root: Mapping[str, object]) -> list[str]:
             continue
         result.append(path)
     return result
+
+
+def classify_root_scan(
+    root: Mapping[str, object],
+    matching_paths: Iterable[str | os.PathLike[str]] | None = None,
+) -> RootScanClassification:
+    """Classify filtered input with one all-supported-formats filesystem scan."""
+
+    matching = (
+        scan_root(root)
+        if matching_paths is None
+        else [os.fspath(path) for path in matching_paths]
+    )
+    unfiltered_root = dict(root)
+    unfiltered_root["extensions"] = config.DEFAULT_EXTENSIONS
+    unfiltered = scan_root(unfiltered_root)
+    if matching:
+        if all(
+            files.extension_for(path, config.DEFAULT_EXTENSIONS) == ".rat"
+            for path in matching
+        ):
+            return RootScanClassification("only-rat")
+        return RootScanClassification("has-matching")
+    if unfiltered:
+        return RootScanClassification("hidden-by-filter", len(unfiltered))
+    return RootScanClassification("empty")
 
 
 def sensible_rungs(

@@ -734,6 +734,29 @@ if QtCore is not None:
                 widths[os.path.abspath(path)] = value[0] if value is not None else None
             return paths, widths, prepare.sensible_rungs(paths, dimensions)
 
+        def _focus_root_formats(self, root_path):
+            root = self._root_by_path(root_path)
+            if root is None:
+                return
+            row = self._root_entries().index(root)
+            item = self.roots_list.topLevelItem(row)
+            button = self._root_format_buttons.get(root_path)
+            if item is None or button is None:
+                return
+            self.roots_list.setCurrentItem(item)
+            button.setFocus()
+            QtCore.QTimer.singleShot(0, button.showMenu)
+
+        def _filtered_action_text(self, label, classification):
+            if classification.state == "empty":
+                return "{} (no supported images found)".format(label)
+            if classification.state == "hidden-by-filter":
+                count = classification.hidden_count
+                return "{} ({} file{} hidden by format filter)".format(
+                    label, count, "" if count == 1 else "s"
+                )
+            return label
+
         def _show_root_context_menu(self, position):
             item = self.roots_list.itemAt(position)
             if item is None:
@@ -745,11 +768,22 @@ if QtCore is not None:
                 return
             root = roots[row]
             paths, widths, rungs = self._root_scope(root)
+            classification = prepare.classify_root_scan(root, paths)
             available = bool(paths) and self._thread is None
 
             menu = QtWidgets.QMenu(self.roots_list)
-            convert_action = QAction("Convert to .rat", menu)
-            convert_action.setEnabled(available)
+            menu.setToolTipsVisible(True)
+            convert_label = "Convert to .rat"
+            if classification.state == "only-rat":
+                convert_label += " (all matching files are already .rat)"
+            else:
+                convert_label = self._filtered_action_text(
+                    convert_label, classification
+                )
+            convert_action = QAction(convert_label, menu)
+            convert_action.setEnabled(
+                available and classification.state != "only-rat"
+            )
             convert_action.triggered.connect(
                 lambda _checked=False, root_path=root["path"], values=paths: self._confirm_root_action(
                     root_path, values, {}, True, (), "Convert to .rat"
@@ -757,7 +791,10 @@ if QtCore is not None:
             )
             menu.addAction(convert_action)
 
-            lowres_menu = menu.addMenu("Generate Low-Res Versions")
+            lowres_label = self._filtered_action_text(
+                "Generate Low-Res Versions", classification
+            )
+            lowres_menu = menu.addMenu(lowres_label)
             if not available or not rungs:
                 empty = QAction("No lower standard rungs available", lowres_menu)
                 empty.setEnabled(False)
@@ -793,7 +830,10 @@ if QtCore is not None:
                     lowres_menu.addAction(action)
 
             menu.addSeparator()
-            prepare_action = QAction("Prepare for Library…", menu)
+            prepare_action = QAction(
+                self._filtered_action_text("Prepare for Library…", classification),
+                menu,
+            )
             prepare_action.setEnabled(available)
             prepare_action.triggered.connect(
                 lambda _checked=False, root_path=root["path"], values=paths, known_widths=widths, useful=rungs: self._show_prepare_dialog(
@@ -801,6 +841,22 @@ if QtCore is not None:
                 )
             )
             menu.addAction(prepare_action)
+            if classification.state == "hidden-by-filter":
+                tooltip = (
+                    "This folder's format selection excludes these supported files. "
+                    "Use Edit Formats… to include them."
+                )
+                convert_action.setToolTip(tooltip)
+                lowres_menu.menuAction().setToolTip(tooltip)
+                prepare_action.setToolTip(tooltip)
+            menu.addSeparator()
+            edit_formats = QAction("Edit Formats…", menu)
+            edit_formats.triggered.connect(
+                lambda _checked=False, root_path=root["path"]: self._focus_root_formats(
+                    root_path
+                )
+            )
+            menu.addAction(edit_formats)
             menu.exec(self.roots_list.viewport().mapToGlobal(position))
 
         def _dialog_result(self, dialog):

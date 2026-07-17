@@ -433,6 +433,33 @@ def main(argv=None) -> int:
         assert str(large) in scanned and str(small) in scanned
         assert str(generated_4k / "old.exr") not in scanned
 
+        classification_root = work / "classification-root"
+        classification_root.mkdir()
+        classification_exr = classification_root / "source.exr"
+        classification_exr.touch()
+        classification = prepare.classify_root_scan(
+            {"path": str(classification_root), "extensions": [".exr"]}
+        )
+        assert classification.state == "has-matching"
+        classification = prepare.classify_root_scan(
+            {"path": str(classification_root), "extensions": [".rat"]}
+        )
+        assert classification.state == "hidden-by-filter"
+        assert classification.hidden_count == 1
+        classification_exr.unlink()
+        classification_rat = classification_root / "source.rat"
+        classification_rat.touch()
+        classification = prepare.classify_root_scan(
+            {"path": str(classification_root), "extensions": [".rat"]}
+        )
+        assert classification.state == "only-rat"
+        classification_rat.unlink()
+        (classification_root / "notes.txt").touch()
+        classification = prepare.classify_root_scan(
+            {"path": str(classification_root), "extensions": [".rat"]}
+        )
+        assert classification.state == "empty"
+
         original_parallel_rat = convert.convert_to_rat_parallel
         original_parallel_resize = resize.resize_to_rung_parallel
         pipeline_calls = []
