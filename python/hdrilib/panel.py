@@ -1574,7 +1574,9 @@ if QtCore is not None:
             self._rebuild_root_settings(row)
             self._rebuild_locations()
 
-        def _add_tree_directory(self, path, parent, root, combo_prefix, seen_combo_paths):
+        def _add_tree_directory(self, path, parent, root):
+            """Populate the sidebar hierarchy only; the dropdown lists entries."""
+
             try:
                 directories = sorted(
                     (
@@ -1594,16 +1596,7 @@ if QtCore is not None:
                 item.setData(0, ROOT_ROLE, root["path"])
                 item.setToolTip(0, directory.path)
                 item.setIcon(0, icon)
-                relative = os.path.relpath(directory.path, root["path"]).replace(os.sep, " / ")
-                self._add_combo_folder(
-                    directory.path,
-                    "{} / {}".format(combo_prefix, relative),
-                    root,
-                    seen_combo_paths,
-                )
-                self._add_tree_directory(
-                    directory.path, item, root, combo_prefix, seen_combo_paths
-                )
+                self._add_tree_directory(directory.path, item, root)
 
         def _add_combo_folder(self, path, label, root, seen_paths):
             key = (root["path"], path)
@@ -1658,7 +1651,7 @@ if QtCore is not None:
                 item.setData(0, ROOT_ROLE, path)
                 item.setIcon(0, self._color_icon(root.get("color", "")))
                 self._add_combo_folder(path, label, root, seen_combo_paths)
-                self._add_tree_directory(path, item, root, label, seen_combo_paths)
+                self._add_tree_directory(path, item, root)
                 if self._folder == path:
                     selected_item = item
 
