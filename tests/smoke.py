@@ -57,20 +57,82 @@ def environmental_tool_failure(error):
     )
 
 
+def fixture_inventory(source: Path) -> dict[str, int]:
+    counts = {".exr": 0, ".hdr": 0, ".rat": 0}
+    if source.is_dir():
+        for path in source.rglob("*"):
+            suffix = path.suffix.lower()
+            if suffix in counts and path.is_file():
+                counts[suffix] += 1
+    return counts
+
+
+def fixture_complete(source: Path) -> bool:
+    counts = fixture_inventory(source)
+    return counts[".exr"] >= 1 and counts[".hdr"] >= 3 and counts[".rat"] >= 1
+
+
+def resolve_source(explicit: str | None) -> Path | None:
+    """Pick the first candidate folder holding a complete fixture set.
+
+    The parallel-thumbnail stage needs at least three HDRs; the RAT bridge and
+    EXR probes need one of each. Symlinks into a real library are fine.
+    """
+
+    if explicit:
+        candidates = [explicit]
+    else:
+        candidates = [
+            os.environ.get("HDRILIB_TEST_DIR"),
+            str(config.config_dir() / "smoke-fixtures"),
+            "~/Desktop/hdri",
+            "/Users/pscale/Desktop/hdri",
+        ]
+    tried = []
+    for candidate in candidates:
+        if not candidate:
+            continue
+        path = Path(candidate).expanduser()
+        if fixture_complete(path):
+            return path.resolve()
+        counts = fixture_inventory(path)
+        tried.append(
+            "  {} ({})".format(
+                path,
+                "missing"
+                if not path.is_dir()
+                else "exr={exr} hdr={hdr} rat={rat}".format(
+                    exr=counts[".exr"], hdr=counts[".hdr"], rat=counts[".rat"]
+                ),
+            )
+        )
+    print("SMOKE SKIP: no usable fixture folder found. Checked:")
+    print("\n".join(tried))
+    print(
+        "Provide a folder with >=1 .exr, >=3 .hdr and >=1 .rat via --source or"
+        " HDRILIB_TEST_DIR, or symlink real textures into {}.".format(
+            config.config_dir() / "smoke-fixtures"
+        )
+    )
+    return None
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--source",
-        default=os.environ.get("HDRILIB_TEST_DIR", "/Users/pscale/Desktop/hdri"),
-        help="Folder containing real RAT and HDR textures",
+        default=None,
+        help="Folder containing real RAT, EXR and HDR textures"
+        " (default: $HDRILIB_TEST_DIR, then known fixture folders)",
     )
     return parser.parse_args(argv)
 
 
 def main(argv=None) -> int:
     args = parse_args(argv)
-    source = Path(args.source).expanduser().resolve()
-    assert source.is_dir(), "test texture folder is missing: {}".format(source)
+    source = resolve_source(args.source)
+    if source is None:
+        return 2
     config.config_dir().mkdir(parents=True, exist_ok=True)
     assert panel._format_duration(9) == "9s"
     assert panel._format_duration(130) == "2m 10s"

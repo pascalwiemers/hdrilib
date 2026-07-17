@@ -104,6 +104,39 @@ def hoiiotool_command(
     ]
 
 
+def hoiiotool_fallback_command(
+    executable: str,
+    source: str | os.PathLike[str],
+    output: str | os.PathLike[str],
+    size: int = 256,
+) -> list[str]:
+    """Build an OCIO-free approximation of the display transform.
+
+    Used when neither Houdini's shipped config nor the site config can resolve
+    the recipe's color space names; a 2.2 gamma keeps thumbnails readable.
+    """
+
+    return [
+        executable,
+        os.fspath(source),
+        "--resize",
+        "{}x0".format(int(size)),
+        "--mulc",
+        EXPOSURE_MULTIPLIER,
+        "--powc",
+        "0.4545",
+        "-d",
+        "uint8",
+        "-o",
+        os.fspath(output),
+    ]
+
+
+def _looks_like_ocio_failure(detail: str) -> bool:
+    message = detail.lower()
+    return "ocio" in message or "color space" in message or "colorconfig" in message
+
+
 def iconvert_command(
     executable: str,
     source: str | os.PathLike[str],
@@ -208,6 +241,18 @@ def generate_thumbnail(
                 os.replace(str(temporary), str(target))
                 return str(target)
             errors.append("{}: {}".format(hoiiotool, detail))
+            if _looks_like_ocio_failure(detail):
+                command = hoiiotool_fallback_command(
+                    hoiiotool, conversion_source, temporary_name, size
+                )
+                ok, detail = _run(command, timeout, cancel_event)
+                if cancel_event is not None and cancel_event.is_set():
+                    raise ThumbnailCancelled("Thumbnail generation cancelled")
+                temporary = Path(temporary_name)
+                if ok and temporary.is_file() and temporary.stat().st_size > 0:
+                    os.replace(str(temporary), str(target))
+                    return str(target)
+                errors.append("{} (gamma fallback): {}".format(hoiiotool, detail))
         except ThumbnailCancelled:
             raise
         except (OSError, ThumbnailError) as error:
