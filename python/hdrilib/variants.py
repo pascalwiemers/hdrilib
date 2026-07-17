@@ -12,7 +12,8 @@ Rules, in confidence order; anything unmatched stays ungrouped:
 The source format is not part of the group key, so RAT-only rungs still join a
 native EXR/HDR master.  Both ``foo.rat`` and legacy ``foo.exr.rat`` next to a
 scanned ``foo.exr`` are treated as format companions of that variant, never as
-their own entries.
+their own entries.  A RAT in the configured RAT output subfolder is likewise a
+native companion when that subfolder's parent is part of the same scan.
 """
 
 from __future__ import annotations
@@ -20,6 +21,8 @@ from __future__ import annotations
 import os
 import re
 from typing import Iterable, Mapping
+
+from . import config
 
 _TOKEN_RE = re.compile(r"[_\-. ]((\d{1,3})k)$", re.IGNORECASE)
 _RES_DIR_RE = re.compile(r"^(\d{1,3})k$", re.IGNORECASE)
@@ -84,14 +87,30 @@ def _logical_stem(path: str) -> str:
     return stem
 
 
-def _identity(path: str) -> tuple[tuple[str, str], str | None]:
+def _identity(
+    path: str,
+    rat_subfolder_name: str | None = None,
+    rat_parent_directories: set[str] | None = None,
+) -> tuple[tuple[str, str], str | None]:
     """Return the group key and resolution token for one scanned file."""
 
+    if rat_subfolder_name is None:
+        rat_subfolder_name = str(config.DEFAULT_CONFIG["rat_subfolder_name"])
     directory, name = os.path.split(path)
     stem = _logical_stem(name)
     base, token = split_token(stem)
     parent_dir, leaf = os.path.split(directory)
-    if token is None and _RES_DIR_RE.match(leaf or ""):
+    if (
+        token is None
+        and os.path.splitext(name)[1].lower() == ".rat"
+        and leaf.casefold() == rat_subfolder_name.casefold()
+        and (
+            rat_parent_directories is None
+            or os.path.normcase(parent_dir) in rat_parent_directories
+        )
+    ):
+        directory = parent_dir
+    elif token is None and _RES_DIR_RE.match(leaf or ""):
         token = leaf.lower()
         directory = parent_dir
     key = (
@@ -109,71 +128,70 @@ def _variant_sort(variant: Variant) -> tuple[int, int, str]:
     return (1, -width, variant.path)
 
 
-def build_groups(paths: Iterable[str]) -> list[Group]:
+def build_groups(
+    paths: Iterable[str], rat_subfolder_name: str | None = None
+) -> list[Group]:
     """Group scanned paths; single-member groups are returned too."""
 
+    if rat_subfolder_name is None:
+        rat_subfolder_name = str(config.DEFAULT_CONFIG["rat_subfolder_name"])
     ordered = list(dict.fromkeys(paths))
-    available = set(ordered)
+    scanned_directories = {
+        os.path.normcase(os.path.dirname(path)) for path in ordered
+    }
+    identities = {
+        path: _identity(path, rat_subfolder_name, scanned_directories)
+        for path in ordered
+    }
     companions: dict[str, list[str]] = {}
-    members = []
-    claimed_companions = set()
-    for path in ordered:
-        match = _RAT_SOURCE_RE.search(path)
-        if match and path[: -len(".rat")] in available:
-            companions.setdefault(path[: -len(".rat")], []).append(path)
-            claimed_companions.add(path)
-            continue
-        if path.lower().endswith(".rat"):
-            rat_stem = path[: -len(".rat")]
-            source = next(
-                (
-                    candidate
-                    for candidate in ordered
-                    if candidate != path
-                    and os.path.splitext(candidate)[0] == rat_stem
-                    and os.path.splitext(candidate)[1].lower()
-                    in (".exr", ".hdr", ".png", ".jpg", ".jpeg", ".tif", ".tiff")
-                ),
-                None,
-            )
-            if source is not None:
-                companions.setdefault(source, []).append(path)
-                claimed_companions.add(path)
-                continue
-        members.append(path)
+    claimed_companions: set[str] = set()
 
-    # A RAT-only rung can contain both current ``foo_4k.rat`` and historic
-    # ``foo_4k.exr.rat`` spellings without the native source being present.
-    # Keep one variant for that rung and expose the other spellings as format
-    # companions, just as we do when the native source is present.
-    rat_aliases: dict[tuple[str, str], list[str]] = {}
-    for path in members:
-        if path.lower().endswith(".rat"):
-            alias_key = (
-                os.path.normcase(os.path.dirname(path)),
-                os.path.normcase(_logical_stem(path)),
-            )
-            rat_aliases.setdefault(alias_key, []).append(path)
-    for aliases in rat_aliases.values():
-        if len(aliases) < 2:
+    # Match companions by logical identity instead of their physical path.  This
+    # lets ``rat/foo.rat`` match ``foo.exr`` while retaining exact same-directory
+    # and legacy ``foo.exr.rat`` behavior.
+    buckets: dict[tuple[tuple[str, str], str | None, str], list[str]] = {}
+    for path in ordered:
+        key, token = identities[path]
+        logical_base, _logical_token = split_token(_logical_stem(path))
+        signature = (key, token, os.path.normcase(logical_base))
+        buckets.setdefault(signature, []).append(path)
+
+    for bucket in buckets.values():
+        sources = [
+            path
+            for path in bucket
+            if os.path.splitext(path)[1].lower() in _SOURCE_EXTENSIONS
+        ]
+        rats = [path for path in bucket if path.lower().endswith(".rat")]
+        if sources:
+            for rat in rats:
+                # Preserve the legacy spelling's exact source association when
+                # more than one source format shares this logical identity.
+                embedded_source = rat[: -len(".rat")]
+                source = embedded_source if embedded_source in sources else sources[0]
+                companions.setdefault(source, []).append(rat)
+                claimed_companions.add(rat)
+            continue
+        if len(rats) < 2:
             continue
         primary = min(
-            aliases,
+            rats,
             key=lambda path: (
                 bool(_RAT_SOURCE_RE.search(path)),
                 ordered.index(path),
             ),
         )
-        for alias in aliases:
+        for alias in rats:
             if alias != primary:
                 companions.setdefault(primary, []).append(alias)
                 claimed_companions.add(alias)
-    members = [path for path in members if path not in claimed_companions]
+
+    members = [path for path in ordered if path not in claimed_companions]
 
     grouped: dict[tuple[str, str], list[Variant]] = {}
     order: list[tuple[str, str]] = []
     for path in members:
-        key, token = _identity(path)
+        key, token = identities[path]
         variant = Variant(path, token)
         variant.companions = companions.get(path, [])
         if key not in grouped:

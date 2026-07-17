@@ -463,6 +463,37 @@ def main(argv=None) -> int:
             "/lib/4k/studio.hdr"
         )
         assert variants.pick_variant(by_name["studio"], "2048").label == "1k"
+
+        rat_subfolder_groups = variants.build_groups(
+            [
+                "/lib/foo.exr",
+                "/lib/rat/foo.rat",
+                "/lib/4k/foo.rat",
+                "/lib/1k/foo.rat",
+                "/lib2/rat/bar.rat",
+            ]
+        )
+        rat_subfolder_by_name = {
+            group.name: group for group in rat_subfolder_groups
+        }
+        foo_group = rat_subfolder_by_name["foo"]
+        assert [variant.label for variant in foo_group.variants] == [
+            "native",
+            "4k",
+            "1k",
+        ]
+        assert foo_group.variants[0].path == "/lib/foo.exr"
+        assert foo_group.variants[0].companions == ["/lib/rat/foo.rat"]
+        assert variants.pick_variant(foo_group, "highest").path == "/lib/foo.exr"
+        assert rat_subfolder_by_name["bar"].variants[0].path == "/lib2/rat/bar.rat"
+        assert len(rat_subfolder_by_name["bar"].variants) == 1
+
+        casefolded_rat_group = variants.build_groups(
+            ["/case/baz.exr", "/case/RAT/baz.rat"]
+        )[0]
+        assert casefolded_rat_group.variants[0].companions == [
+            "/case/RAT/baz.rat"
+        ]
         print("VARIANTS ok: originals, suffix/subfolder rungs, RAT forms, picks")
         print("PER-ROOT SCAN ok: RAT-only root differs from all-formats root")
 

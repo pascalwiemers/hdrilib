@@ -1970,7 +1970,9 @@ if QtCore is not None:
                 self.grid.addItem(item)
 
             if self._settings.get("group_resolutions", False):
-                groups = variants.build_groups(visible)
+                groups = variants.build_groups(
+                    visible, self._settings.get("rat_subfolder_name", "rat")
+                )
                 for group in groups:
                     lines = []
                     for variant in group.variants:
@@ -2015,7 +2017,14 @@ if QtCore is not None:
             target = item.data(USER_ROLE)
             if group_paths and len(group_paths) > 1:
                 group = next(
-                    (g for g in variants.build_groups(group_paths) if len(g.variants) > 1),
+                    (
+                        g
+                        for g in variants.build_groups(
+                            group_paths,
+                            self._settings.get("rat_subfolder_name", "rat"),
+                        )
+                        if len(g.variants) > 1
+                    ),
                     None,
                 )
                 if group is not None:
@@ -2061,7 +2070,9 @@ if QtCore is not None:
                     [clicked.data(USER_ROLE)] if clicked.data(USER_ROLE) else []
                 )
                 entries = []
-                for group in variants.build_groups(clicked_paths):
+                for group in variants.build_groups(
+                    clicked_paths, self._settings.get("rat_subfolder_name", "rat")
+                ):
                     for variant in group.variants:
                         entries.append(
                             (
