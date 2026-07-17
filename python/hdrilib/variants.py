@@ -139,8 +139,25 @@ def build_groups(
     scanned_directories = {
         os.path.normcase(os.path.dirname(path)) for path in ordered
     }
+    # A rat-subfolder's files fold into the parent directory's groups whenever
+    # that parent is part of the scanned tree — including when the parent's own
+    # files are hidden by a format filter (then only sibling rung folders are
+    # scanned). A root that is itself named like the rat subfolder has no other
+    # scanned structure under its parent and must keep standalone groups.
+    rat_parent_directories = set(scanned_directories)
+    for directory in scanned_directories:
+        parent_dir, leaf = os.path.split(directory)
+        if leaf.casefold() != rat_subfolder_name.casefold():
+            continue
+        parent_key = os.path.normcase(parent_dir)
+        if any(
+            other != directory
+            and (other == parent_key or other.startswith(parent_key + os.sep))
+            for other in scanned_directories
+        ):
+            rat_parent_directories.add(parent_key)
     identities = {
-        path: _identity(path, rat_subfolder_name, scanned_directories)
+        path: _identity(path, rat_subfolder_name, rat_parent_directories)
         for path in ordered
     }
     companions: dict[str, list[str]] = {}
