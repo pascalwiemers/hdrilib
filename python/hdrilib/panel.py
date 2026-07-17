@@ -1461,6 +1461,27 @@ if QtCore is not None:
                 )
             )
             menu.addAction(action)
+            thumb_selected = QAction(
+                "Generate Thumbnails ({} selected)".format(len(selected)), menu
+            )
+            thumb_selected.setEnabled(bool(selected) and self._thread is None)
+            thumb_selected.triggered.connect(
+                lambda _checked=False, paths=selected: self._start_thumbnail_generation(
+                    paths, "selected thumbnail"
+                )
+            )
+            menu.addAction(thumb_selected)
+            all_files = list(self._all_files)
+            thumb_all = QAction(
+                "Generate Thumbnails (all {} in folder)".format(len(all_files)), menu
+            )
+            thumb_all.setEnabled(bool(all_files) and self._thread is None)
+            thumb_all.triggered.connect(
+                lambda _checked=False, paths=all_files: self._start_thumbnail_generation(
+                    paths, "thumbnail"
+                )
+            )
+            menu.addAction(thumb_all)
             lowres_menu = menu.addMenu("Create Low-Res Versions")
             self._populate_lowres_menu(lowres_menu, selected, "selected texture")
             menu.exec(self.grid.viewport().mapToGlobal(position))
