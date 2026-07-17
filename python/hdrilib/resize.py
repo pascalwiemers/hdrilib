@@ -1,4 +1,4 @@
-"""Low-resolution texture variants with cached resolution probing."""
+"""Low-resolution texture variants."""
 
 from __future__ import annotations
 
@@ -10,14 +10,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Mapping
 
-from . import convert
+from . import convert, resolution
 from .houdini import executable as houdini_executable
 from .houdini import run_subprocess
 from .jobs import JobCancelled, run_parallel
 
 
 STANDARD_RUNGS = (16384, 8192, 4096, 2048, 1024)
-_RESOLUTION_RE = re.compile(r"(?:^|\s)(\d+)\s*x\s*(\d+)(?:\s|,|$)", re.IGNORECASE)
 _RUNG_SUFFIX_RE = re.compile(r"_[0-9]+k$", re.IGNORECASE)
 _RAT_SOURCE_SUFFIXES = {
     ".exr",
@@ -30,8 +29,6 @@ _RAT_SOURCE_SUFFIXES = {
     ".tif",
     ".tiff",
 }
-_RESOLUTION_CACHE: dict[tuple[str, int], tuple[int, int]] = {}
-_CACHE_LOCK = threading.Lock()
 
 
 class ResizeError(RuntimeError):
@@ -125,10 +122,6 @@ def build_resize_rat_target(
     return native if Path(source).suffix.lower() == ".rat" else Path(str(native) + ".rat")
 
 
-def hoiiotool_info_command(executable: str, source: str | os.PathLike[str]) -> list[str]:
-    return [executable, "--info", os.fspath(source)]
-
-
 def hoiiotool_resize_command(
     executable: str,
     source: str | os.PathLike[str],
@@ -158,16 +151,6 @@ def iconvert_rat_bridge_command(
     ]
 
 
-def _parse_resolution(detail: str, source: Path) -> tuple[int, int]:
-    match = _RESOLUTION_RE.search(detail)
-    if not match:
-        raise ResizeError("Could not parse resolution for {}: {}".format(source, detail))
-    width, height = int(match.group(1)), int(match.group(2))
-    if width <= 0 or height <= 0:
-        raise ResizeError("Invalid resolution for {}: {}x{}".format(source, width, height))
-    return width, height
-
-
 def _run_checked(
     command: list[str],
     description: str,
@@ -189,58 +172,29 @@ def get_resolution(
     timeout: float = 180.0,
     cancel_event: threading.Event | None = None,
 ) -> tuple[int, int]:
-    """Probe an image once per path/mtime, bridging RAT through float EXR."""
+    """Compatibility adapter for the shared cached resolution probe."""
 
     if cancel_event is not None and cancel_event.is_set():
         raise ResizeCancelled("Resolution probe cancelled")
-    source_path = Path(source).expanduser().resolve()
     try:
-        mtime = source_path.stat().st_mtime_ns
-    except OSError as error:
-        raise ResizeError(str(error)) from error
-    key = (str(source_path), mtime)
-    with _CACHE_LOCK:
-        cached = _RESOLUTION_CACHE.get(key)
-    if cached is not None:
-        return cached
-
-    oiio = hoiiotool or houdini_executable("hoiiotool")
-    if not oiio:
-        raise ResizeError("Could not find $HFS/bin/hoiiotool")
-    probe_source = source_path
-    bridge_name = None
-    try:
-        if source_path.suffix.lower() == ".rat":
-            rat_reader = iconvert or houdini_executable("iconvert")
-            if not rat_reader:
-                raise ResizeError("RAT resolution probing requires $HFS/bin/iconvert")
-            descriptor, bridge_name = tempfile.mkstemp(prefix="hdrilib-info-", suffix=".exr")
-            os.close(descriptor)
-            os.unlink(bridge_name)
-            _run_checked(
-                iconvert_rat_bridge_command(rat_reader, source_path, bridge_name),
-                "iconvert RAT bridge",
-                timeout,
-                cancel_event,
+        if hoiiotool is not None or iconvert is not None or timeout != 180.0:
+            result = resolution._probe_authoritative_with_tools(
+                source,
+                cancel_event=cancel_event,
+                hoiiotool=hoiiotool,
+                iconvert=iconvert,
+                timeout=timeout,
             )
-            probe_source = Path(bridge_name)
-        detail = _run_checked(
-            hoiiotool_info_command(oiio, probe_source),
-            "hoiiotool resolution probe",
-            timeout,
-            cancel_event,
+        else:
+            result = resolution.probe_authoritative(source, cancel_event=cancel_event)
+    except JobCancelled as error:
+        raise ResizeCancelled(str(error)) from error
+    except Exception as error:
+        raise ResizeError(str(error)) from error
+    if result is None:
+        raise ResizeError(
+            "Could not determine resolution for {}".format(Path(source).expanduser().resolve())
         )
-        result = _parse_resolution(detail, source_path)
-    finally:
-        if bridge_name:
-            try:
-                os.unlink(bridge_name)
-            except OSError:
-                pass
-    with _CACHE_LOCK:
-        for stale_key in [value for value in _RESOLUTION_CACHE if value[0] == str(source_path)]:
-            _RESOLUTION_CACHE.pop(stale_key, None)
-        _RESOLUTION_CACHE[key] = result
     return result
 
 

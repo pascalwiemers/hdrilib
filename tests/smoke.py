@@ -20,7 +20,7 @@ PYTHON_ROOT = REPO_ROOT / "python"
 if str(PYTHON_ROOT) not in sys.path:
     sys.path.insert(0, str(PYTHON_ROOT))
 
-from hdrilib import config, convert, files, resize, thumbs  # noqa: E402
+from hdrilib import config, convert, files, resize, resolution, thumbs  # noqa: E402
 from hdrilib.houdini import executable as houdini_executable  # noqa: E402
 import hdrilib.panel as panel  # noqa: E402
 
@@ -70,6 +70,43 @@ def main(argv=None) -> int:
     with tempfile.TemporaryDirectory(prefix="smoke-", dir=str(config.config_dir())) as work:
         work = Path(work)
         config_file = work / "config.json"
+
+        real_exr = next(source.rglob("*.exr"), None)
+        real_hdr = next(source.rglob("*.hdr"), None)
+        assert real_exr is not None and real_hdr is not None, "need real EXR and HDR fixtures"
+        with real_exr.open("rb") as stream:
+            exr_dimensions = resolution._exr_dimensions(stream.read(64 * 1024))
+        with real_hdr.open("rb") as stream:
+            hdr_dimensions = resolution._hdr_dimensions(stream.read(64 * 1024))
+        assert exr_dimensions and min(exr_dimensions) > 0
+        assert hdr_dimensions and min(hdr_dimensions) > 0
+
+        cached_rat = work / "cached.rat"
+        cached_rat.write_bytes(b"not a real RAT")
+        resolution.store(cached_rat, 321, 123)
+        assert resolution.probe_fast(cached_rat) == (321, 123)
+        # Drop process memory to prove the value survives through the JSON cache.
+        resolution._MEMORY_CACHE.clear()
+        resolution._CACHE_LOADED = False
+        assert resolution.probe_fast(cached_rat) == (321, 123)
+        cached_stat = cached_rat.stat()
+        os.utime(
+            cached_rat,
+            ns=(cached_stat.st_atime_ns, cached_stat.st_mtime_ns + 1_000_000_000),
+        )
+        assert resolution.probe_fast(cached_rat) is None
+
+        uncached_rat = work / "uncached.rat"
+        uncached_rat.write_bytes(b"unknown")
+        started = time.perf_counter()
+        assert resolution.probe_fast(uncached_rat) is None
+        elapsed = time.perf_counter() - started
+        assert elapsed < 0.05, "uncached RAT fast probe took {:.1f}ms".format(elapsed * 1000)
+        print(
+            "RESOLUTION FAST ok: EXR {}x{}, HDR {}x{}, persistent cache, RAT {:.1f}ms".format(
+                *exr_dimensions, *hdr_dimensions, elapsed * 1000
+            )
+        )
 
         # Load a literal schema-v1 file to exercise migration rather than merely
         # passing legacy-shaped data through save_config().

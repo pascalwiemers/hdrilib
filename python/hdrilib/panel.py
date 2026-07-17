@@ -10,7 +10,7 @@ import os
 import threading
 from pathlib import Path
 
-from . import assign, config, convert, files, resize, thumbs
+from . import assign, config, convert, files, resize, resolution, thumbs
 
 try:
     from hutil.Qt import QtCore, QtGui, QtWidgets
@@ -1096,20 +1096,24 @@ if QtCore is not None:
             if not paths or self._thread is not None:
                 menu.setEnabled(False)
                 return
-            resolutions, errors = resize.probe_resolutions(paths)
-            widths = {path: dimensions[0] for path, dimensions in resolutions.items()}
-            rungs = resize.rungs_below_largest(widths.values())
+            widths = {}
+            unknown = 0
+            for path in paths:
+                dimensions = resolution.probe_fast(path)
+                if dimensions is None:
+                    unknown += 1
+                else:
+                    widths[path] = dimensions[0]
+            rungs = (
+                resize.STANDARD_RUNGS
+                if unknown
+                else resize.rungs_below_largest(widths.values())
+            )
             if not rungs:
                 action = QAction("No lower standard rungs available", menu)
                 action.setEnabled(False)
                 menu.addAction(action)
                 menu.setEnabled(False)
-                if errors:
-                    self.status.setText(
-                        "Could not read {} texture resolution{}.".format(
-                            len(errors), "" if len(errors) == 1 else "s"
-                        )
-                    )
                 return
             for width in rungs:
                 eligible, skipped = resize.partition_by_width(widths, width)
@@ -1117,8 +1121,8 @@ if QtCore is not None:
                 counts = "{} ({} resize, {} skip)".format(
                     label, len(eligible), len(skipped)
                 )
-                if errors:
-                    counts += ", {} unknown".format(len(errors))
+                if unknown:
+                    counts += ", {} unknown".format(unknown)
                 action = QAction(counts, menu)
                 action.triggered.connect(
                     lambda _checked=False, values=paths, rung=width, scope=description: self._start_lowres(
@@ -1126,12 +1130,6 @@ if QtCore is not None:
                     )
                 )
                 menu.addAction(action)
-            if errors:
-                self.status.setText(
-                    "Read {} of {} resolutions; unreadable files will be reported by the job.".format(
-                        len(resolutions), len(paths)
-                    )
-                )
 
         def _show_folder_lowres_menu(self):
             if self._thread is not None:

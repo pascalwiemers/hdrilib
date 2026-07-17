@@ -9,6 +9,7 @@ import threading
 from pathlib import Path
 from typing import Callable, Iterable
 
+from . import resolution
 from .config import thumbs_dir
 from .houdini import executable as _executable
 from .houdini import houdini_hfs as _houdini_hfs
@@ -144,6 +145,8 @@ def generate_thumbnail(
     source_path = Path(source).expanduser().resolve()
     if not source_path.is_file():
         raise ThumbnailError("Source image does not exist: {}".format(source_path))
+    # Header sniffing is cheap and lets thumbnail jobs warm the UI resolution cache.
+    resolution.probe_fast(source_path)
     size = max(32, min(2048, int(size)))
     target = thumbnail_path(source_path, size=size, cache_dir=cache_dir)
     if not force and target.is_file() and target.stat().st_size > 0:
@@ -189,6 +192,9 @@ def generate_thumbnail(
                 if not ok or not Path(bridge_name).is_file():
                     raise ThumbnailError("iconvert RAT bridge failed: {}".format(detail))
                 conversion_source = Path(bridge_name)
+                dimensions = resolution.probe_fast(conversion_source)
+                if dimensions is not None:
+                    resolution.store(source_path, *dimensions)
 
             command = hoiiotool_command(hoiiotool, conversion_source, temporary_name, size)
             ok, detail = _run(command, timeout, cancel_event)
@@ -229,6 +235,11 @@ def generate_thumbnail(
                 raise ThumbnailCancelled("Thumbnail generation cancelled")
             temporary = Path(temporary_name)
             if ok and temporary.is_file() and temporary.stat().st_size > 0:
+                # This compatibility conversion does not resize, so its PNG keeps
+                # the source dimensions that the job just learned.
+                dimensions = resolution.probe_fast(temporary)
+                if dimensions is not None:
+                    resolution.store(source_path, *dimensions)
                 os.replace(str(temporary), str(target))
                 return str(target)
             errors.append("{}: {}".format(iconvert, detail))

@@ -131,7 +131,10 @@ resolves relative to that directory.
    default. RAT sources are bridged through a temporary float EXR and returned as RAT;
    **Also convert to .rat** keeps the native low-res copy and adds a mipmapped companion
    such as `sky_4k.exr.rat`. Up-to-date outputs are skipped unless overwrite is enabled.
-   Resolution probes are cached by path and modification time. Batches use the shared
+   Resolution probes use pure-Python EXR, HDR, PNG, JPEG, and TIFF header readers on
+   UI paths, backed by a persistent cache keyed by path, modification time, and size.
+   Houdini subprocess probing is reserved for background jobs and unknown formats.
+   Batches use the shared
    worker setting, progress bar, and Cancel button, and refresh the grid on completion.
 8. Select a supported light and double-click a texture:
 
