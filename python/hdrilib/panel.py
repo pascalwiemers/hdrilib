@@ -1284,11 +1284,32 @@ if QtCore is not None:
             except OSError:
                 subfolders = []
             if subfolders:
-                chosen = self._pick_subfolder_entries(selected, subfolders)
-                if chosen is None:
+                box = QtWidgets.QMessageBox(self)
+                box.setWindowTitle("Add HDRI folder")
+                box.setText(
+                    "{} contains {} subfolder{}.".format(
+                        os.path.basename(selected) or selected,
+                        len(subfolders),
+                        "" if len(subfolders) == 1 else "s",
+                    )
+                )
+                box.setInformativeText("Add subfolders as separate library entries?")
+                accept_role = _enum(QtWidgets.QMessageBox, "ButtonRole", "AcceptRole")
+                single = box.addButton("This folder only", accept_role)
+                choose = box.addButton("Choose subfolders…", accept_role)
+                cancel = box.addButton(
+                    _enum(QtWidgets.QMessageBox, "StandardButton", "Cancel")
+                )
+                box.setDefaultButton(single)
+                box.exec()
+                if box.clickedButton() is cancel:
                     return
-                if chosen:
-                    additions = chosen
+                if box.clickedButton() is choose:
+                    chosen = self._pick_subfolder_entries(selected)
+                    if chosen is None:
+                        return
+                    if chosen:
+                        additions = chosen
             roots = self._root_entries()
             known = {root["path"] for root in roots}
             row = None
@@ -1338,60 +1359,90 @@ if QtCore is not None:
                 rows = {self.roots_list.indexOfTopLevelItem(current)}
             return sorted(row for row in rows if 0 <= row < len(roots))
 
-        def _pick_subfolder_entries(self, selected, subfolders):
-            """Ask which subfolders become entries.
+        def _pick_subfolder_entries(self, selected):
+            """Show the full nested folder tree with checkboxes.
 
             Returns ``None`` on cancel, ``[]`` for "this folder only", or the
-            checked subfolder paths.
+            checked folder paths. Only the first level starts checked so deep
+            trees do not explode into hundreds of entries by accident.
             """
 
             dialog = QtWidgets.QDialog(self)
             dialog.setWindowTitle("Add HDRI folder")
+            dialog.resize(460, 420)
             layout = QtWidgets.QVBoxLayout(dialog)
             layout.addWidget(
                 QtWidgets.QLabel(
-                    "{} contains {} subfolder{}. Add them as separate"
-                    " library entries?".format(
-                        os.path.basename(selected) or selected,
-                        len(subfolders),
-                        "" if len(subfolders) == 1 else "s",
+                    "Check every folder that should become its own"
+                    " library entry under {}:".format(
+                        os.path.basename(selected) or selected
                     )
                 )
             )
-            listing = QtWidgets.QListWidget()
+            tree = QtWidgets.QTreeWidget()
+            tree.setHeaderHidden(True)
             checkable = _enum(QtCore.Qt, "ItemFlag", "ItemIsUserCheckable")
             checked = _enum(QtCore.Qt, "CheckState", "Checked")
             unchecked = _enum(QtCore.Qt, "CheckState", "Unchecked")
-            for path in subfolders:
-                entry = QtWidgets.QListWidgetItem(os.path.basename(path))
-                entry.setToolTip(path)
-                entry.setData(USER_ROLE, path)
-                entry.setFlags(entry.flags() | checkable)
-                entry.setCheckState(checked)
-                listing.addItem(entry)
-            layout.addWidget(listing, 1)
+
+            def add_children(parent_item, directory, depth):
+                try:
+                    entries = sorted(
+                        (
+                            entry.path
+                            for entry in os.scandir(directory)
+                            if entry.is_dir() and files._wanted_directory(entry.name)
+                        ),
+                        key=str.lower,
+                    )
+                except OSError:
+                    return
+                for path in entries:
+                    item = QtWidgets.QTreeWidgetItem(
+                        parent_item, [os.path.basename(path)]
+                    )
+                    item.setToolTip(0, path)
+                    item.setData(0, USER_ROLE, path)
+                    item.setFlags(item.flags() | checkable)
+                    item.setCheckState(0, checked if depth == 0 else unchecked)
+                    add_children(item, path, depth + 1)
+
+            add_children(tree, selected, 0)
+            tree.expandToDepth(0)
+            layout.addWidget(tree, 1)
 
             def checked_paths():
-                return [
-                    listing.item(index).data(USER_ROLE)
-                    for index in range(listing.count())
-                    if _enum_value(listing.item(index).checkState())
-                    == _enum_value(checked)
-                ]
+                result = []
+                iterator = QtWidgets.QTreeWidgetItemIterator(tree)
+                while iterator.value():
+                    item = iterator.value()
+                    if _enum_value(item.checkState(0)) == _enum_value(checked):
+                        result.append(item.data(0, USER_ROLE))
+                    iterator += 1
+                return result
 
             select_bar = QtWidgets.QHBoxLayout()
             all_button = QtWidgets.QPushButton("All")
+            top_button = QtWidgets.QPushButton("Top level")
             none_button = QtWidgets.QPushButton("None")
             select_bar.addWidget(all_button)
+            select_bar.addWidget(top_button)
             select_bar.addWidget(none_button)
             select_bar.addStretch(1)
             layout.addLayout(select_bar)
 
-            def set_all(state):
-                for index in range(listing.count()):
-                    listing.item(index).setCheckState(state)
+            def set_all(state, top_state=None):
+                iterator = QtWidgets.QTreeWidgetItemIterator(tree)
+                while iterator.value():
+                    item = iterator.value()
+                    top = item.parent() is None
+                    item.setCheckState(
+                        0, top_state if top and top_state is not None else state
+                    )
+                    iterator += 1
 
             all_button.clicked.connect(lambda: set_all(checked))
+            top_button.clicked.connect(lambda: set_all(unchecked, top_state=checked))
             none_button.clicked.connect(lambda: set_all(unchecked))
 
             button_bar = QtWidgets.QHBoxLayout()
@@ -1409,7 +1460,7 @@ if QtCore is not None:
                 add_button.setText("Add selected ({})".format(count))
                 add_button.setEnabled(count > 0)
 
-            listing.itemChanged.connect(lambda _item: refresh_add_label())
+            tree.itemChanged.connect(lambda _item, _column: refresh_add_label())
             refresh_add_label()
             add_button.setDefault(True)
 
