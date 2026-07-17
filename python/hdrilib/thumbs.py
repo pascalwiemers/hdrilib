@@ -13,6 +13,7 @@ from . import resolution
 from .config import thumbs_dir
 from .houdini import executable as _executable
 from .houdini import houdini_hfs as _houdini_hfs
+from .houdini import houdini_ocio_environment as _ocio_environment
 from .houdini import run_subprocess as _run
 from .jobs import JobCancelled, run_parallel
 
@@ -197,7 +198,9 @@ def generate_thumbnail(
                     resolution.store(source_path, *dimensions)
 
             command = hoiiotool_command(hoiiotool, conversion_source, temporary_name, size)
-            ok, detail = _run(command, timeout, cancel_event)
+            # The recipe's color space names belong to Houdini's shipped OCIO
+            # config; a site OCIO variable would make them unresolvable.
+            ok, detail = _run(command, timeout, cancel_event, env=_ocio_environment())
             if cancel_event is not None and cancel_event.is_set():
                 raise ThumbnailCancelled("Thumbnail generation cancelled")
             temporary = Path(temporary_name)

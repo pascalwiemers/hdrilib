@@ -32,10 +32,38 @@ def executable(name: str, hfs: str | None = None) -> str | None:
     return shutil.which(name)
 
 
+def houdini_ocio_config(hfs: str | None = None) -> str | None:
+    """Return Houdini's shipped OCIO config, whose color space names our recipes use."""
+
+    hfs = hfs or houdini_hfs()
+    if not hfs:
+        return None
+    matches = sorted(Path(hfs).glob("packages/ocio/houdini-config-*.ocio"))
+    return str(matches[-1]) if matches else None
+
+
+def houdini_ocio_environment(hfs: str | None = None) -> dict[str, str] | None:
+    """Build a subprocess environment pinned to Houdini's OCIO config.
+
+    A site OCIO variable (for example an ACES 1.2 studio config) renames every
+    color space, which breaks converters invoked with Houdini-config names.
+    Returns ``None`` when the shipped config cannot be found, so callers fall
+    back to the inherited environment.
+    """
+
+    config = houdini_ocio_config(hfs=hfs)
+    if not config:
+        return None
+    environment = dict(os.environ)
+    environment["OCIO"] = config
+    return environment
+
+
 def run_subprocess(
     command: list[str],
     timeout: float,
     cancel_event: threading.Event | None = None,
+    env: dict[str, str] | None = None,
 ) -> tuple[bool, str]:
     """Run one converter, polling for cancellation and enforcing a timeout."""
 
@@ -45,6 +73,7 @@ def run_subprocess(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            env=env,
         )
         while True:
             if cancel_event is not None and cancel_event.is_set():
