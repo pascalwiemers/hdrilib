@@ -315,6 +315,27 @@ if QtCore is not None:
             self.settings_tab = QtWidgets.QWidget()
             self.tabs.addTab(self.browse_tab, "Browse")
             self.tabs.addTab(self.settings_tab, "Settings")
+
+            # The job bar lives outside the tabs so progress from jobs started
+            # in either tab (Browse buttons or Settings context menus) is
+            # always visible.
+            generation_bar = QtWidgets.QHBoxLayout()
+            self.generate_button = QtWidgets.QPushButton("Generate thumbnails")
+            self.cancel_button = QtWidgets.QPushButton("Cancel")
+            self.cancel_button.setEnabled(False)
+            self.progress = QtWidgets.QProgressBar()
+            self.progress.setTextVisible(True)
+            self.progress.setRange(0, 1)
+            self.progress.setValue(0)
+            generation_bar.addWidget(self.generate_button)
+            generation_bar.addWidget(self.cancel_button)
+            generation_bar.addWidget(self.progress, 1)
+            outer.addLayout(generation_bar)
+
+            self.status = QtWidgets.QLabel("Add an HDRI root in Settings to begin.")
+            self.status.setWordWrap(True)
+            outer.addWidget(self.status)
+
             self._build_browse_tab()
             self._build_settings_tab()
 
@@ -374,23 +395,6 @@ if QtCore is not None:
             self.splitter.addWidget(self.grid)
             self.splitter.setStretchFactor(1, 1)
             layout.addWidget(self.splitter, 1)
-
-            generation_bar = QtWidgets.QHBoxLayout()
-            self.generate_button = QtWidgets.QPushButton("Generate thumbnails")
-            self.cancel_button = QtWidgets.QPushButton("Cancel")
-            self.cancel_button.setEnabled(False)
-            self.progress = QtWidgets.QProgressBar()
-            self.progress.setTextVisible(True)
-            self.progress.setRange(0, 1)
-            self.progress.setValue(0)
-            generation_bar.addWidget(self.generate_button)
-            generation_bar.addWidget(self.cancel_button)
-            generation_bar.addWidget(self.progress, 1)
-            layout.addLayout(generation_bar)
-
-            self.status = QtWidgets.QLabel("Add an HDRI root in Settings to begin.")
-            self.status.setWordWrap(True)
-            layout.addWidget(self.status)
 
             self.refresh_button.clicked.connect(self._refresh)
             self.convert_folder_button.clicked.connect(self._start_folder_conversion)
