@@ -82,6 +82,9 @@ if QtCore is not None:
     TOOLTIP_ROLE = _enum(QtCore.Qt, "ItemDataRole", "ToolTipRole")
     ROOT_ROLE = _enum_value(USER_ROLE) + 1
     GROUP_ROLE = _enum_value(USER_ROLE) + 2
+    ICON_ROLE = _enum_value(USER_ROLE) + 3
+    KEEP_ASPECT = _enum(QtCore.Qt, "AspectRatioMode", "KeepAspectRatio")
+    SMOOTH = _enum(QtCore.Qt, "TransformationMode", "SmoothTransformation")
     ALIGN_CENTER = _enum(QtCore.Qt, "AlignmentFlag", "AlignCenter")
     HORIZONTAL = _enum(QtCore.Qt, "Orientation", "Horizontal")
     ICON_MODE = _enum(QtWidgets.QListView, "ViewMode", "IconMode")
@@ -700,6 +703,7 @@ if QtCore is not None:
                 self.grid.setSpacing(6)
                 self.grid.setIconSize(QtCore.QSize(size, max(32, size // 2)))
                 self.grid.setGridSize(QtCore.QSize(size + 24, max(100, size // 2 + 48)))
+            self._refresh_grid_icons()
 
         def _grouping_changed(self, checked):
             self._settings["group_resolutions"] = bool(checked)
@@ -718,6 +722,28 @@ if QtCore is not None:
             self._apply_icon_size()
             if not self.icon_size_slider.isSliderDown():
                 self._save()
+
+        def _display_icon(self, path):
+            """Scale the cached PNG to the current icon size.
+
+            QIcon never upscales a pixmap past its native resolution, so the
+            slider must bake the target size into the pixmap itself.
+            """
+
+            pixmap = QtGui.QPixmap(path)
+            if pixmap.isNull():
+                return None
+            return QtGui.QIcon(pixmap.scaled(self.grid.iconSize(), KEEP_ASPECT, SMOOTH))
+
+        def _refresh_grid_icons(self):
+            for index in range(self.grid.count()):
+                item = self.grid.item(index)
+                path = item.data(ICON_ROLE)
+                if not path:
+                    continue
+                icon = self._display_icon(path)
+                if icon is not None:
+                    item.setIcon(icon)
 
         def _save(self):
             self._settings["last_folder"] = self._folder or ""
@@ -1862,7 +1888,10 @@ if QtCore is not None:
                     cached = thumbs.cached_thumbnail(candidate, size=size, tonemap=tonemap)
                     if cached:
                         break
-                item.setIcon(QtGui.QIcon(cached) if cached else fallback_icon)
+                icon = self._display_icon(cached) if cached else None
+                if cached:
+                    item.setData(ICON_ROLE, cached)
+                item.setIcon(icon if icon is not None else fallback_icon)
                 self.grid.addItem(item)
 
             if self._settings.get("group_resolutions", False):
@@ -2406,8 +2435,16 @@ if QtCore is not None:
         def _thumbnail_ready(self, source, thumbnail):
             for index in range(self.grid.count()):
                 item = self.grid.item(index)
-                if item.data(USER_ROLE) == source:
-                    item.setIcon(QtGui.QIcon(thumbnail))
+                group_paths = item.data(GROUP_ROLE)
+                if item.data(USER_ROLE) == source or (
+                    group_paths and source in group_paths
+                ):
+                    if item.data(ICON_ROLE) and item.data(USER_ROLE) != source:
+                        break
+                    item.setData(ICON_ROLE, thumbnail)
+                    icon = self._display_icon(thumbnail)
+                    if icon is not None:
+                        item.setIcon(icon)
                     break
 
         def _thumbnail_problem(self, source, message):
