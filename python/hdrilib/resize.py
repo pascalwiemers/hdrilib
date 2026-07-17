@@ -274,6 +274,7 @@ def resize_to_rung(
     target_width: int,
     mode: str = "alongside",
     also_rat: bool = False,
+    output_format: str | None = None,
     overwrite: bool = False,
     hoiiotool: str | None = None,
     iconvert: str | None = None,
@@ -283,7 +284,7 @@ def resize_to_rung(
     source_root: str | os.PathLike[str] | None = None,
     output_root: str | os.PathLike[str] | None = None,
 ) -> ResizeResult:
-    """Create one low-res variant, plus an optional mipmapped RAT companion."""
+    """Create native, mipmapped RAT, or both low-res output formats."""
 
     source_path = Path(source).expanduser().resolve()
     width = int(target_width)
@@ -303,17 +304,24 @@ def resize_to_rung(
         output_root=output_root,
     )
     source_is_rat = source_path.suffix.lower() == ".rat"
-    targets = [native_target]
-    if also_rat and not source_is_rat:
-        targets.append(
-            build_resize_rat_target(
-                source_path,
-                width,
-                mode,
-                source_root=source_root,
-                output_root=output_root,
-            )
-        )
+    selected_format = output_format or ("both" if also_rat else "native")
+    if selected_format not in ("native", "rat", "both"):
+        raise ValueError("Low-res output format must be 'native', 'rat', or 'both'")
+    rat_target = build_resize_rat_target(
+        source_path,
+        width,
+        mode,
+        source_root=source_root,
+        output_root=output_root,
+    )
+    if source_is_rat:
+        targets = [native_target]
+    elif selected_format == "native":
+        targets = [native_target]
+    elif selected_format == "rat":
+        targets = [rat_target]
+    else:
+        targets = [native_target, rat_target]
     if source_width <= width:
         return ResizeResult(
             str(source_path), tuple(str(target) for target in targets), "skipped", "source_too_small"
@@ -382,13 +390,6 @@ def resize_to_rung(
         if not resized_exr.is_file() or resized_exr.stat().st_size <= 0:
             raise ResizeError("hoiiotool did not create the resized float EXR")
 
-        rat_target = native_target if source_is_rat else build_resize_rat_target(
-            source_path,
-            width,
-            mode,
-            source_root=source_root,
-            output_root=output_root,
-        )
         if rat_target in needed:
             convert.write_rat(
                 resized_exr,
@@ -415,6 +416,7 @@ def resize_to_rung_parallel(
     target_width: int,
     mode: str = "alongside",
     also_rat: bool = False,
+    output_format: str | None = None,
     overwrite: bool = False,
     workers: int = 1,
     cancel_event: threading.Event | None = None,
@@ -439,6 +441,7 @@ def resize_to_rung_parallel(
             target_width,
             mode=mode,
             also_rat=also_rat,
+            output_format=output_format,
             overwrite=overwrite,
             cancel_event=event,
             source_root=source_root,

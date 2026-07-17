@@ -28,6 +28,7 @@ class PipelinePlan:
     convert_originals: bool
     resize_stages: tuple[ResizeStage, ...]
     convert_generated: bool
+    lowres_format: str = "both"
 
     @property
     def rungs(self) -> tuple[int, ...]:
@@ -40,12 +41,7 @@ class PipelinePlan:
     @property
     def total(self) -> int:
         resize_count = sum(len(stage.sources) for stage in self.resize_stages)
-        generated_count = (
-            sum(len(stage.targets) for stage in self.resize_stages)
-            if self.convert_generated
-            else 0
-        )
-        return (len(self.sources) if self.convert_originals else 0) + resize_count + generated_count
+        return (len(self.sources) if self.convert_originals else 0) + resize_count
 
 
 @dataclass
@@ -152,9 +148,12 @@ def build_pipeline_plan(
     convert_to_rat: bool = False,
     rungs: Iterable[int] = (),
     widths: Mapping[str, int | None] | None = None,
+    lowres_format: str = "both",
 ) -> PipelinePlan:
     """Build a deterministic plan without touching image tools or creating files."""
 
+    if lowres_format not in ("native", "rat", "both"):
+        raise ValueError("Low-res output format must be 'native', 'rat', or 'both'")
     root_path = _absolute_path(root)
     root_key = _path_key(root_path)
     normalized_widths = (
@@ -194,31 +193,41 @@ def build_pipeline_plan(
             if source_width is not None and int(source_width) <= width:
                 continue
             candidates.append(source)
-            targets.append(
-                str(
-                    resize.build_resize_target(
-                        source,
-                        width,
-                        "subfolder",
-                        source_root=root_path,
-                        output_root=root_path,
-                    )
-                )
+            native_target = resize.build_resize_target(
+                source,
+                width,
+                "subfolder",
+                source_root=root_path,
+                output_root=root_path,
             )
+            rat_target = resize.build_resize_rat_target(
+                source,
+                width,
+                "subfolder",
+                source_root=root_path,
+                output_root=root_path,
+            )
+            if Path(source).suffix.lower() == ".rat" or lowres_format == "native":
+                targets.append(str(native_target))
+            elif lowres_format == "rat":
+                targets.append(str(rat_target))
+            else:
+                targets.extend((str(native_target), str(rat_target)))
         stages.append(ResizeStage(width, tuple(candidates), tuple(targets)))
     return PipelinePlan(
         root_path,
         tuple(unique),
         bool(convert_to_rat),
         tuple(stages),
-        bool(convert_to_rat and stages),
+        False,
+        lowres_format,
     )
 
 
 def generated_root_entries(
     existing_roots: Sequence[Mapping[str, object]],
     parent_root: Mapping[str, object],
-    folders: Iterable[tuple[str | os.PathLike[str], str, bool]],
+    folders: Iterable[tuple[str | os.PathLike[str], str, object]],
 ) -> list[dict[str, object]]:
     """Return deduplicated roots for generated folders, inheriting parent attrs."""
 
@@ -229,18 +238,26 @@ def generated_root_entries(
         parent_label = os.path.basename(os.path.normpath(parent_path)) or parent_path
     inherited_extensions = list(parent_root.get("extensions") or ())
     result = []
-    for folder, suffix, rat_only in folders:
+    for folder, suffix, output_format in folders:
         path = _absolute_path(folder)
         key = _path_key(path)
         if key in seen:
             continue
         seen.add(key)
+        if output_format is True or output_format == "rat":
+            extensions = [".rat"]
+        elif output_format == "both":
+            extensions = list(inherited_extensions)
+            if ".rat" not in extensions:
+                extensions.append(".rat")
+        else:
+            extensions = list(inherited_extensions)
         result.append(
             {
                 "path": path,
                 "label": "{} {}".format(parent_label, str(suffix).strip()).strip(),
                 "color": str(parent_root.get("color") or ""),
-                "extensions": [".rat"] if rat_only else list(inherited_extensions),
+                "extensions": extensions,
             }
         )
     return result
@@ -281,12 +298,7 @@ def final_thumbnail_paths(
             str(convert.build_rat_target(source, rat_mode, rat_subfolder_name))
             for source in plan.sources
         )
-    if plan.convert_generated:
-        candidates.extend(
-            str(convert.build_rat_target(target, rat_mode, rat_subfolder_name))
-            for target in generated
-        )
-    elif resize_also_rat:
+    if resize_also_rat and plan.lowres_format == "native":
         for stage in plan.resize_stages:
             candidates.extend(
                 str(
@@ -332,7 +344,6 @@ def run_pipeline(
     event = cancel_event or threading.Event()
     summary = PipelineSummary()
     total = plan.total
-    generated_ready = set()
 
     def progressed(_current: int, _stage_total: int) -> None:
         summary.completed += 1
@@ -352,13 +363,9 @@ def run_pipeline(
 
     def resized(_source: str, result: resize.ResizeResult) -> None:
         summary.resized += 1
-        if result.target:
-            generated_ready.add(_path_key(result.target))
 
     def resize_skipped(_source: str, target: str, reason: str) -> None:
         summary.skipped += 1
-        if reason == "target_newer" and target:
-            generated_ready.add(_path_key(target))
 
     if plan.convert_originals and not event.is_set():
         convert.convert_to_rat_parallel(
@@ -381,7 +388,11 @@ def run_pipeline(
             stage.sources,
             stage.width,
             mode="subfolder",
-            also_rat=bool(resize_also_rat and not plan.convert_generated),
+            output_format=(
+                "both"
+                if resize_also_rat and plan.lowres_format == "native"
+                else plan.lowres_format
+            ),
             overwrite=resize_overwrite,
             workers=workers,
             cancel_event=event,
@@ -392,29 +403,6 @@ def run_pipeline(
             on_error=problem,
             on_progress=progressed,
         )
-
-    if plan.convert_generated and not event.is_set():
-        generated = [target for stage in plan.resize_stages for target in stage.targets]
-        existing = []
-        for target in generated:
-            if _path_key(target) in generated_ready and os.path.isfile(target):
-                existing.append(target)
-            else:
-                summary.skipped += 1
-                progressed(0, 0)
-        if existing and not event.is_set():
-            convert.convert_to_rat_parallel(
-                existing,
-                mode=rat_mode,
-                subfolder_name=rat_subfolder_name,
-                overwrite=rat_overwrite,
-                workers=workers,
-                cancel_event=event,
-                on_result=converted,
-                on_skipped=skipped,
-                on_error=problem,
-                on_progress=progressed,
-            )
 
     if generate_thumbnails and not event.is_set():
         thumbnail_paths = final_thumbnail_paths(

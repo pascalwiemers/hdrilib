@@ -152,6 +152,7 @@ def main(argv=None) -> int:
         assert migrated["lowres_output_mode"] == "alongside"
         assert migrated["lowres_also_rat"] is False
         assert migrated["lowres_overwrite_existing"] is False
+        assert migrated["prepare_lowres_format"] == "both"
         assert migrated["prepare_generate_thumbnails"] is True
 
         # Version 2 stored richer root objects but still kept both format sets
@@ -210,6 +211,7 @@ def main(argv=None) -> int:
                 "lowres_also_rat": "yes",
                 "lowres_overwrite_existing": "yes",
                 "prepare_generate_thumbnails": "yes",
+                "prepare_lowres_format": "invalid",
                 "include_subfolders": "yes",
                 "unknown_key": "discard me",
             }
@@ -233,6 +235,7 @@ def main(argv=None) -> int:
         assert strict["lowres_also_rat"] is False
         assert strict["lowres_overwrite_existing"] is False
         assert strict["prepare_generate_thumbnails"] is True
+        assert strict["prepare_lowres_format"] == "both"
         assert strict["include_subfolders"] is False
         assert "unknown_key" not in strict
         assert "enabled_extensions" not in strict
@@ -276,6 +279,7 @@ def main(argv=None) -> int:
                 "lowres_overwrite_existing": True,
                 "prepare_auto_add_subfolders": False,
                 "prepare_generate_thumbnails": False,
+                "prepare_lowres_format": "rat",
                 "include_subfolders": True,
                 "last_folder": str(source),
                 "search_text": "church",
@@ -296,6 +300,7 @@ def main(argv=None) -> int:
         assert loaded["lowres_overwrite_existing"] is True
         assert loaded["prepare_auto_add_subfolders"] is False
         assert loaded["prepare_generate_thumbnails"] is False
+        assert loaded["prepare_lowres_format"] == "rat"
 
         scans = [
             files.scan_files(
@@ -305,7 +310,7 @@ def main(argv=None) -> int:
         ]
         assert [Path(path).suffix for path in scans[0]] == [".rat"]
         assert {Path(path).suffix for path in scans[1]} == {".rat", ".hdr"}
-        print("CONFIG ok: v1/v2 migration, strict v7 normalization, round trip")
+        print("CONFIG ok: v1/v2 migration, strict v8 normalization, round trip")
         print("PER-ROOT SCAN ok: RAT-only root differs from all-formats root")
 
         target_source = work / "targets" / "sunset.exr"
@@ -393,15 +398,50 @@ def main(argv=None) -> int:
             convert_to_rat=True,
             rungs=(4096, 2048),
             widths={str(large): 9000, str(small): 1500},
+            lowres_format="both",
         )
         assert plan.sources == (str(large), str(small))
         assert plan.rungs == (4096, 2048)
         assert plan.resize_stages[0].sources == (str(large),)
         assert plan.resize_stages[0].targets == (
             str(prepare_root / "4k" / "nested" / "large.exr"),
+            str(prepare_root / "4k" / "nested" / "large.exr.rat"),
         )
         assert plan.resize_stages[1].sources == (str(large),)
-        assert plan.total == 6  # two originals + two resizes + two generated RATs
+        assert plan.total == 4  # two original conversions + two combined resizes
+
+        native_plan = prepare.build_pipeline_plan(
+            prepare_root,
+            [large],
+            rungs=(4096,),
+            widths={str(large): 9000},
+            lowres_format="native",
+        )
+        rat_only_plan = prepare.build_pipeline_plan(
+            prepare_root,
+            [large],
+            rungs=(4096,),
+            widths={str(large): 9000},
+            lowres_format="rat",
+        )
+        both_plan = prepare.build_pipeline_plan(
+            prepare_root,
+            [large],
+            rungs=(4096,),
+            widths={str(large): 9000},
+            lowres_format="both",
+        )
+        native_target = str(prepare_root / "4k" / "nested" / "large.exr")
+        rat_target = native_target + ".rat"
+        assert native_plan.resize_stages[0].targets == (native_target,)
+        assert rat_only_plan.resize_stages[0].targets == (rat_target,)
+        assert native_target not in rat_only_plan.resize_stages[0].targets
+        assert both_plan.resize_stages[0].targets == (native_target, rat_target)
+        Path(rat_target).parent.mkdir(parents=True, exist_ok=True)
+        Path(rat_target).touch()
+        rat_thumbnail_paths = prepare.final_thumbnail_paths(rat_only_plan)
+        assert rat_thumbnail_paths == [str(large), rat_target]
+        assert native_target not in rat_thumbnail_paths
         assert prepare.sensible_rungs(
             [large, small], {str(large): (9000, 4500), str(small): None}
         ) == prepare.PREPARE_RUNGS
@@ -417,6 +457,7 @@ def main(argv=None) -> int:
             convert_to_rat=True,
             rungs=(4096,),
             widths={str(thumbnail_rat): 9000},
+            lowres_format="both",
         )
         thumbnail_lowres = Path(thumbnail_plan.resize_stages[0].targets[0])
         thumbnail_lowres.parent.mkdir(parents=True, exist_ok=True)
@@ -460,7 +501,7 @@ def main(argv=None) -> int:
                 (prepare_root / "4k", "4k", False),
                 (prepare_root / "2k", "2k", False),
                 (prepare_root / "rat", "rat", True),
-                (prepare_root / "2k", "duplicate", True),
+                (prepare_root / "2k", "duplicate", "rat"),
             ],
         )
         assert generated == [
@@ -476,6 +517,20 @@ def main(argv=None) -> int:
                 "color": "#123456",
                 "extensions": [".rat"],
             },
+        ]
+        format_roots = prepare.generated_root_entries(
+            [],
+            parent_root,
+            [
+                (prepare_root / "native", "native", "native"),
+                (prepare_root / "rat-only", "rat", "rat"),
+                (prepare_root / "both", "both", "both"),
+            ],
+        )
+        assert [root["extensions"] for root in format_roots] == [
+            [".exr", ".hdr"],
+            [".rat"],
+            [".exr", ".hdr", ".rat"],
         ]
         generated_4k = prepare_root / "4k"
         generated_4k.mkdir(exist_ok=True)
@@ -526,7 +581,9 @@ def main(argv=None) -> int:
 
         def fake_resize(paths, width, **kwargs):
             values = list(paths)
-            pipeline_calls.append(("resize", width, tuple(values)))
+            pipeline_calls.append(
+                ("resize", width, tuple(values), kwargs.get("output_format"))
+            )
             for index, value in enumerate(values, 1):
                 target = resize.build_resize_target(
                     value,
@@ -562,11 +619,14 @@ def main(argv=None) -> int:
             "rat",
             "resize",
             "resize",
-            "rat",
         ]
-        assert summary.converted == 4 and summary.resized == 2
-        assert summary.completed == plan.total == 6
-        assert pipeline_progress[-1] == (6, 6)
+        assert [call[3] for call in pipeline_calls if call[0] == "resize"] == [
+            "both",
+            "both",
+        ]
+        assert summary.converted == 2 and summary.resized == 2
+        assert summary.completed == plan.total == 4
+        assert pipeline_progress[-1] == (4, 4)
         print(
             "PREPARE LOGIC ok: plan/queue, root-level targets, "
             "auto-add inheritance/dedupe"

@@ -250,7 +250,6 @@ if QtCore is not None:
                     rat_overwrite=bool(
                         self._settings.get("rat_overwrite_existing", False)
                     ),
-                    resize_also_rat=bool(self._settings.get("lowres_also_rat", False)),
                     resize_overwrite=bool(
                         self._settings.get("lowres_overwrite_existing", False)
                     ),
@@ -916,6 +915,20 @@ if QtCore is not None:
                     )
                 )
             )
+            lowres_format = self._settings.get("prepare_lowres_format", "both")
+            if rungs:
+                format_labels = {
+                    "native": "same as original",
+                    "rat": ".rat (mipmapped)",
+                    "both": "same as original + .rat (mipmapped)",
+                }
+                layout.addWidget(
+                    QtWidgets.QLabel(
+                        "Low-res output: {}".format(
+                            format_labels.get(lowres_format, format_labels["both"])
+                        )
+                    )
+                )
             add_roots = QtWidgets.QCheckBox(
                 "Add generated subfolders to folder list"
             )
@@ -942,6 +955,7 @@ if QtCore is not None:
                 convert_to_rat=convert_rat,
                 rungs=rungs,
                 widths=widths or None,
+                lowres_format=lowres_format,
             )
             self._start_root_prepare(
                 plan,
@@ -961,7 +975,7 @@ if QtCore is not None:
                     )
                 )
             )
-            convert_box = QtWidgets.QCheckBox("Convert originals to .rat")
+            convert_box = QtWidgets.QCheckBox("Convert ORIGINAL source files to .rat")
             convert_box.setChecked(True)
             layout.addWidget(convert_box)
             rung_boxes = []
@@ -972,6 +986,28 @@ if QtCore is not None:
                 box.setChecked(True)
                 layout.addWidget(box)
                 rung_boxes.append((width, box))
+
+            format_group = QtWidgets.QGroupBox("Low-res output format")
+            format_layout = QtWidgets.QVBoxLayout(format_group)
+            native_radio = QtWidgets.QRadioButton(
+                "Same as original (.exr/.hdr/…)"
+            )
+            rat_radio = QtWidgets.QRadioButton(".rat (mipmapped)")
+            both_radio = QtWidgets.QRadioButton("Both")
+            format_layout.addWidget(native_radio)
+            format_layout.addWidget(rat_radio)
+            format_layout.addWidget(both_radio)
+            explanation = QtWidgets.QLabel(
+                "Low-res versions are always rendered from the original pixels; "
+                "this only chooses the saved format."
+            )
+            explanation.setWordWrap(True)
+            format_layout.addWidget(explanation)
+            selected_format = self._settings.get("prepare_lowres_format", "both")
+            native_radio.setChecked(selected_format == "native")
+            rat_radio.setChecked(selected_format == "rat")
+            both_radio.setChecked(selected_format not in ("native", "rat"))
+            layout.addWidget(format_group)
             add_roots = QtWidgets.QCheckBox(
                 "Add generated subfolders to folder list"
             )
@@ -993,6 +1029,13 @@ if QtCore is not None:
             if self._dialog_result(dialog) != DIALOG_ACCEPTED:
                 return
             rungs = tuple(width for width, box in rung_boxes if box.isChecked())
+            lowres_format = (
+                "native"
+                if native_radio.isChecked()
+                else "rat"
+                if rat_radio.isChecked()
+                else "both"
+            )
             if not convert_box.isChecked() and not rungs:
                 self.status.setText("Choose at least one preparation action.")
                 return
@@ -1002,6 +1045,7 @@ if QtCore is not None:
                 convert_to_rat=convert_box.isChecked(),
                 rungs=rungs,
                 widths=widths,
+                lowres_format=lowres_format,
             )
             self._start_root_prepare(
                 plan,
@@ -1600,6 +1644,9 @@ if QtCore is not None:
             self, plan, add_roots, generate_thumbnails, description
         ):
             changed = False
+            if self._settings.get("prepare_lowres_format", "both") != plan.lowres_format:
+                self._settings["prepare_lowres_format"] = plan.lowres_format
+                changed = True
             if bool(self._settings.get("prepare_auto_add_subfolders", True)) != bool(add_roots):
                 self._settings["prepare_auto_add_subfolders"] = bool(add_roots)
                 changed = True
@@ -1622,7 +1669,7 @@ if QtCore is not None:
                 return
 
             generated = [
-                (folder, resize.rung_label(width), None)
+                (folder, resize.rung_label(width), plan.lowres_format)
                 for folder, width in zip(plan.generated_folders, plan.rungs)
             ]
             if (
