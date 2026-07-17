@@ -418,7 +418,9 @@ if QtCore is not None:
             self.grid.setResizeMode(ADJUST)
             self.grid.setMovement(STATIC_MOVEMENT)
             self.grid.setSelectionMode(EXTENDED_SELECTION)
-            self.grid.setUniformItemSizes(True)
+            # Uniform item sizes caches a stale size hint and crops rescaled
+            # icons; the fixed grid size already keeps the layout regular.
+            self.grid.setUniformItemSizes(False)
             self.grid.setWordWrap(True)
             self.grid.setSpacing(6)
             self.grid.setContextMenuPolicy(CUSTOM_CONTEXT_MENU)
@@ -520,8 +522,8 @@ if QtCore is not None:
             ):
                 self.assign_resolution_combo.addItem("Closest to " + label, str(width))
             self.assign_resolution_combo.setToolTip(
-                "Which resolution variant a double-click assigns when"
-                " \"Group resolutions\" is on."
+                "Which resolution variant a double-click assigns. Only active"
+                " while \"Group resolutions\" is enabled in Browse."
             )
             thumbnail_layout.addRow("Preview size", self.thumbnail_size_spin)
             thumbnail_layout.addRow("Parallel workers", self.thumbnail_workers_spin)
@@ -640,6 +642,9 @@ if QtCore is not None:
                 bool(self._settings.get("group_resolutions", False))
             )
             self.group_resolutions.blockSignals(False)
+            self.assign_resolution_combo.setEnabled(
+                bool(self._settings.get("group_resolutions", False))
+            )
             self.view_mode_combo.blockSignals(True)
             self.view_mode_combo.setCurrentIndex(
                 1 if self._settings.get("view_mode") == "list" else 0
@@ -701,12 +706,19 @@ if QtCore is not None:
                 self.grid.setViewMode(ICON_MODE)
                 self.grid.setWordWrap(True)
                 self.grid.setSpacing(6)
-                self.grid.setIconSize(QtCore.QSize(size, max(32, size // 2)))
-                self.grid.setGridSize(QtCore.QSize(size + 24, max(100, size // 2 + 48)))
+                icon_height = max(32, size // 2)
+                # Full 2:1 panorama plus two label lines must fit the cell,
+                # otherwise the view crops the thumbnail bottom.
+                text_height = self.grid.fontMetrics().height() * 2 + 12
+                self.grid.setIconSize(QtCore.QSize(size, icon_height))
+                self.grid.setGridSize(
+                    QtCore.QSize(size + 16, icon_height + text_height + 12)
+                )
             self._refresh_grid_icons()
 
         def _grouping_changed(self, checked):
             self._settings["group_resolutions"] = bool(checked)
+            self.assign_resolution_combo.setEnabled(bool(checked))
             self._save()
             self._populate_grid()
 
@@ -733,7 +745,19 @@ if QtCore is not None:
             pixmap = QtGui.QPixmap(path)
             if pixmap.isNull():
                 return None
-            return QtGui.QIcon(pixmap.scaled(self.grid.iconSize(), KEEP_ASPECT, SMOOTH))
+            try:
+                ratio = float(self.grid.devicePixelRatioF())
+            except AttributeError:
+                ratio = float(self.grid.devicePixelRatio())
+            target = self.grid.iconSize()
+            scaled = pixmap.scaled(
+                max(1, int(target.width() * ratio)),
+                max(1, int(target.height() * ratio)),
+                KEEP_ASPECT,
+                SMOOTH,
+            )
+            scaled.setDevicePixelRatio(ratio)
+            return QtGui.QIcon(scaled)
 
         def _refresh_grid_icons(self):
             for index in range(self.grid.count()):
