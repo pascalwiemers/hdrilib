@@ -101,7 +101,11 @@ def _variant_stem_and_suffix(source: Path) -> tuple[str, str]:
 
 
 def build_resize_target(
-    source: str | os.PathLike[str], target_width: int, mode: str = "alongside"
+    source: str | os.PathLike[str],
+    target_width: int,
+    mode: str = "alongside",
+    source_root: str | os.PathLike[str] | None = None,
+    output_root: str | os.PathLike[str] | None = None,
 ) -> Path:
     """Build a same-format low-res target without stacking ``_NNk`` suffixes."""
 
@@ -111,14 +115,30 @@ def build_resize_target(
     if mode == "alongside":
         return source_path.parent / (stem + "_" + label + suffix)
     if mode == "subfolder":
+        if source_root is not None or output_root is not None:
+            if source_root is None or output_root is None:
+                raise ValueError("source_root and output_root must be provided together")
+            source_base = Path(source_root).expanduser().resolve()
+            output_base = Path(output_root).expanduser().resolve()
+            try:
+                relative_parent = source_path.resolve().parent.relative_to(source_base)
+            except ValueError as error:
+                raise ValueError("Resize source must be inside source_root") from error
+            return output_base / label / relative_parent / (stem + suffix)
         return source_path.parent / label / (stem + suffix)
     raise ValueError("Low-res output mode must be 'alongside' or 'subfolder'")
 
 
 def build_resize_rat_target(
-    source: str | os.PathLike[str], target_width: int, mode: str = "alongside"
+    source: str | os.PathLike[str],
+    target_width: int,
+    mode: str = "alongside",
+    source_root: str | os.PathLike[str] | None = None,
+    output_root: str | os.PathLike[str] | None = None,
 ) -> Path:
-    native = build_resize_target(source, target_width, mode)
+    native = build_resize_target(
+        source, target_width, mode, source_root=source_root, output_root=output_root
+    )
     return native if Path(source).suffix.lower() == ".rat" else Path(str(native) + ".rat")
 
 
@@ -260,6 +280,8 @@ def resize_to_rung(
     rat_executable: str | None = None,
     timeout: float = 600.0,
     cancel_event: threading.Event | None = None,
+    source_root: str | os.PathLike[str] | None = None,
+    output_root: str | os.PathLike[str] | None = None,
 ) -> ResizeResult:
     """Create one low-res variant, plus an optional mipmapped RAT companion."""
 
@@ -273,11 +295,25 @@ def resize_to_rung(
         timeout=timeout,
         cancel_event=cancel_event,
     )
-    native_target = build_resize_target(source_path, width, mode)
+    native_target = build_resize_target(
+        source_path,
+        width,
+        mode,
+        source_root=source_root,
+        output_root=output_root,
+    )
     source_is_rat = source_path.suffix.lower() == ".rat"
     targets = [native_target]
     if also_rat and not source_is_rat:
-        targets.append(build_resize_rat_target(source_path, width, mode))
+        targets.append(
+            build_resize_rat_target(
+                source_path,
+                width,
+                mode,
+                source_root=source_root,
+                output_root=output_root,
+            )
+        )
     if source_width <= width:
         return ResizeResult(
             str(source_path), tuple(str(target) for target in targets), "skipped", "source_too_small"
@@ -347,7 +383,11 @@ def resize_to_rung(
             raise ResizeError("hoiiotool did not create the resized float EXR")
 
         rat_target = native_target if source_is_rat else build_resize_rat_target(
-            source_path, width, mode
+            source_path,
+            width,
+            mode,
+            source_root=source_root,
+            output_root=output_root,
         )
         if rat_target in needed:
             convert.write_rat(
@@ -382,6 +422,8 @@ def resize_to_rung_parallel(
     on_skipped: Callable[[str, str, str], None] | None = None,
     on_error: Callable[[str, Exception], None] | None = None,
     on_progress: Callable[[int, int], None] | None = None,
+    source_root: str | os.PathLike[str] | None = None,
+    output_root: str | os.PathLike[str] | None = None,
 ) -> tuple[int, int, bool]:
     sources = []
     seen = set()
@@ -399,6 +441,8 @@ def resize_to_rung_parallel(
             also_rat=also_rat,
             overwrite=overwrite,
             cancel_event=event,
+            source_root=source_root,
+            output_root=output_root,
         )
 
     def result(source: str, resized: ResizeResult) -> None:

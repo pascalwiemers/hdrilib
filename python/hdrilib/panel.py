@@ -10,7 +10,7 @@ import os
 import threading
 from pathlib import Path
 
-from . import assign, config, convert, files, resize, resolution, thumbs
+from . import assign, config, convert, files, prepare, resize, resolution, thumbs
 
 try:
     from hutil.Qt import QtCore, QtGui, QtWidgets
@@ -73,6 +73,9 @@ if QtCore is not None:
     CUSTOM_CONTEXT_MENU = _enum(QtCore.Qt, "ContextMenuPolicy", "CustomContextMenu")
     STANDARD_FILE_ICON = _enum(QtWidgets.QStyle, "StandardPixmap", "SP_FileIcon")
     ITEM_IS_EDITABLE = _enum(QtCore.Qt, "ItemFlag", "ItemIsEditable")
+    DIALOG_ACCEPTED = _enum_value(_enum(QtWidgets.QDialog, "DialogCode", "Accepted"))
+    DIALOG_OK = _enum(QtWidgets.QDialogButtonBox, "StandardButton", "Ok")
+    DIALOG_CANCEL = _enum(QtWidgets.QDialogButtonBox, "StandardButton", "Cancel")
 
 
     class RootSettingsDelegate(QtWidgets.QStyledItemDelegate):
@@ -205,6 +208,55 @@ if QtCore is not None:
             self.finished.emit(self._cancelled.is_set())
 
 
+    class PrepareWorker(QtCore.QObject):
+        """Run a complete Settings-root preparation plan in one Qt job."""
+
+        progress = Signal(int, int)
+        problem = Signal(str, str)
+        finished = Signal(bool, object)
+
+        def __init__(self, plan, settings):
+            super().__init__()
+            self._plan = plan
+            self._settings = dict(settings)
+            self._cancelled = threading.Event()
+
+        def cancel(self):
+            self._cancelled.set()
+
+        @Slot()
+        def run(self):
+            summary = prepare.PipelineSummary()
+            try:
+                summary, cancelled = prepare.run_pipeline(
+                    self._plan,
+                    rat_mode=self._settings.get("rat_output_mode", "alongside"),
+                    rat_subfolder_name=self._settings.get("rat_subfolder_name", "rat"),
+                    rat_overwrite=bool(
+                        self._settings.get("rat_overwrite_existing", False)
+                    ),
+                    resize_also_rat=bool(self._settings.get("lowres_also_rat", False)),
+                    resize_overwrite=bool(
+                        self._settings.get("lowres_overwrite_existing", False)
+                    ),
+                    workers=int(
+                        self._settings.get(
+                            "thumbnail_workers", config.DEFAULT_THUMBNAIL_WORKERS
+                        )
+                    ),
+                    cancel_event=self._cancelled,
+                    on_progress=self.progress.emit,
+                    on_problem=lambda source, error: self.problem.emit(
+                        source, str(error)
+                    ),
+                )
+            except Exception as error:
+                summary.failed += 1
+                self.problem.emit("", str(error))
+                cancelled = self._cancelled.is_set()
+            self.finished.emit(cancelled, summary)
+
+
     class HDRILibPanel(QtWidgets.QWidget):
         """Main HDRI Library widget."""
 
@@ -219,6 +271,7 @@ if QtCore is not None:
             self._job_kind = None
             self._generation_errors = 0
             self._conversion_skipped = 0
+            self._prepare_context = None
             self._format_actions = {}
             self._root_format_buttons = {}
             self._updating_roots = False
@@ -342,6 +395,7 @@ if QtCore is not None:
             self.roots_list.setRootIsDecorated(False)
             self.roots_list.setAlternatingRowColors(True)
             self.roots_list.setItemDelegate(RootSettingsDelegate(self.roots_list))
+            self.roots_list.setContextMenuPolicy(CUSTOM_CONTEXT_MENU)
             roots_layout.addWidget(self.roots_list)
             root_buttons = QtWidgets.QHBoxLayout()
             self.settings_add_root = QtWidgets.QPushButton("Add…")
@@ -432,6 +486,9 @@ if QtCore is not None:
             self.roots_list.itemChanged.connect(self._root_item_changed)
             self.roots_list.currentItemChanged.connect(self._root_selection_changed)
             self.roots_list.itemDoubleClicked.connect(self._root_item_double_clicked)
+            self.roots_list.customContextMenuRequested.connect(
+                self._show_root_context_menu
+            )
             self.sidebar_radio.toggled.connect(
                 lambda checked: checked and self.set_location_ui_mode("sidebar")
             )
@@ -664,6 +721,172 @@ if QtCore is not None:
             if column == 2:
                 self.roots_list.setCurrentItem(item)
                 self._choose_root_color()
+
+        def _root_scope(self, root):
+            if root is None or not os.path.isdir(root.get("path", "")):
+                return [], {}, ()
+            paths = prepare.scan_root(root)
+            dimensions = {}
+            widths = {}
+            for path in paths:
+                value = resolution.probe_fast(path)
+                dimensions[os.path.abspath(path)] = value
+                widths[os.path.abspath(path)] = value[0] if value is not None else None
+            return paths, widths, prepare.sensible_rungs(paths, dimensions)
+
+        def _show_root_context_menu(self, position):
+            item = self.roots_list.itemAt(position)
+            if item is None:
+                return
+            self.roots_list.setCurrentItem(item)
+            row = self.roots_list.indexOfTopLevelItem(item)
+            roots = self._root_entries()
+            if not 0 <= row < len(roots):
+                return
+            root = roots[row]
+            paths, widths, rungs = self._root_scope(root)
+            available = bool(paths) and self._thread is None
+
+            menu = QtWidgets.QMenu(self.roots_list)
+            convert_action = QAction("Convert to .rat", menu)
+            convert_action.setEnabled(available)
+            convert_action.triggered.connect(
+                lambda _checked=False, root_path=root["path"], values=paths: self._confirm_root_action(
+                    root_path, values, {}, True, (), "Convert to .rat"
+                )
+            )
+            menu.addAction(convert_action)
+
+            lowres_menu = menu.addMenu("Generate Low-Res Versions")
+            if not available or not rungs:
+                empty = QAction("No lower standard rungs available", lowres_menu)
+                empty.setEnabled(False)
+                lowres_menu.addAction(empty)
+                lowres_menu.setEnabled(False)
+            else:
+                unknown = sum(value is None for value in widths.values())
+                for width in rungs:
+                    known = {
+                        path: value
+                        for path, value in widths.items()
+                        if value is not None
+                    }
+                    eligible, skipped = resize.partition_by_width(known, width)
+                    label = "{} ({} resize, {} skip)".format(
+                        resize.rung_label(width).upper(), len(eligible), len(skipped)
+                    )
+                    if unknown:
+                        label += ", {} unknown".format(unknown)
+                    action = QAction(label, lowres_menu)
+                    action.triggered.connect(
+                        lambda _checked=False, root_path=root["path"], values=paths, known_widths=widths, rung=width: self._confirm_root_action(
+                            root_path,
+                            values,
+                            known_widths,
+                            False,
+                            (rung,),
+                            "Generate {} Versions".format(
+                                resize.rung_label(rung).upper()
+                            ),
+                        )
+                    )
+                    lowres_menu.addAction(action)
+
+            menu.addSeparator()
+            prepare_action = QAction("Prepare for Library…", menu)
+            prepare_action.setEnabled(available)
+            prepare_action.triggered.connect(
+                lambda _checked=False, root_path=root["path"], values=paths, known_widths=widths, useful=rungs: self._show_prepare_dialog(
+                    root_path, values, known_widths, useful
+                )
+            )
+            menu.addAction(prepare_action)
+            menu.exec(self.roots_list.viewport().mapToGlobal(position))
+
+        def _dialog_result(self, dialog):
+            execute = getattr(dialog, "exec", None) or dialog.exec_
+            return _enum_value(execute())
+
+        def _confirm_root_action(
+            self, root_path, paths, widths, convert_rat, rungs, title
+        ):
+            dialog = QtWidgets.QDialog(self)
+            dialog.setWindowTitle(title)
+            layout = QtWidgets.QVBoxLayout(dialog)
+            layout.addWidget(
+                QtWidgets.QLabel(
+                    "Process {} matching file{} recursively?".format(
+                        len(paths), "" if len(paths) == 1 else "s"
+                    )
+                )
+            )
+            add_roots = QtWidgets.QCheckBox(
+                "Add generated subfolders to folder list"
+            )
+            add_roots.setChecked(True)
+            layout.addWidget(add_roots)
+            buttons = QtWidgets.QDialogButtonBox(DIALOG_OK | DIALOG_CANCEL)
+            buttons.accepted.connect(dialog.accept)
+            buttons.rejected.connect(dialog.reject)
+            layout.addWidget(buttons)
+            if self._dialog_result(dialog) != DIALOG_ACCEPTED:
+                return
+            plan = prepare.build_pipeline_plan(
+                root_path,
+                paths,
+                convert_to_rat=convert_rat,
+                rungs=rungs,
+                widths=widths or None,
+            )
+            self._start_root_prepare(plan, add_roots.isChecked(), title)
+
+        def _show_prepare_dialog(self, root_path, paths, widths, useful_rungs):
+            dialog = QtWidgets.QDialog(self)
+            dialog.setWindowTitle("Prepare for Library")
+            layout = QtWidgets.QVBoxLayout(dialog)
+            layout.addWidget(
+                QtWidgets.QLabel(
+                    "Prepare {} matching file{} recursively:".format(
+                        len(paths), "" if len(paths) == 1 else "s"
+                    )
+                )
+            )
+            convert_box = QtWidgets.QCheckBox("Convert originals to .rat")
+            convert_box.setChecked(True)
+            layout.addWidget(convert_box)
+            rung_boxes = []
+            for width in useful_rungs:
+                box = QtWidgets.QCheckBox(
+                    "Generate {} versions".format(resize.rung_label(width).upper())
+                )
+                box.setChecked(True)
+                layout.addWidget(box)
+                rung_boxes.append((width, box))
+            add_roots = QtWidgets.QCheckBox(
+                "Add generated subfolders to folder list"
+            )
+            add_roots.setChecked(True)
+            layout.addWidget(add_roots)
+            buttons = QtWidgets.QDialogButtonBox(DIALOG_OK | DIALOG_CANCEL)
+            buttons.accepted.connect(dialog.accept)
+            buttons.rejected.connect(dialog.reject)
+            layout.addWidget(buttons)
+            if self._dialog_result(dialog) != DIALOG_ACCEPTED:
+                return
+            rungs = tuple(width for width, box in rung_boxes if box.isChecked())
+            if not convert_box.isChecked() and not rungs:
+                self.status.setText("Choose at least one preparation action.")
+                return
+            plan = prepare.build_pipeline_plan(
+                root_path,
+                paths,
+                convert_to_rat=convert_box.isChecked(),
+                rungs=rungs,
+                widths=widths,
+            )
+            self._start_root_prepare(
+                plan, add_roots.isChecked(), "Prepare for Library"
+            )
 
         def _root_format_changed(self, root_path, extension, checked):
             root = self._root_by_path(root_path)
@@ -1253,6 +1476,73 @@ if QtCore is not None:
             )
             thread.start()
 
+        def _start_root_prepare(self, plan, add_roots, description):
+            if self._thread is not None or not plan.total:
+                if not plan.total:
+                    self.status.setText("No matching work was found for this action.")
+                return
+            parent = self._root_by_path(plan.root)
+            if parent is None:
+                self.status.setText("The selected root is no longer in Settings.")
+                return
+
+            generated = [
+                (folder, resize.rung_label(width), None)
+                for folder, width in zip(plan.generated_folders, plan.rungs)
+            ]
+            if (
+                plan.convert_originals
+                and not plan.resize_stages
+                and self._settings.get("rat_output_mode", "alongside") == "subfolder"
+            ):
+                subfolder = self._settings.get("rat_subfolder_name", "rat")
+                seen = set()
+                for source in plan.sources:
+                    folder = str(
+                        convert.build_rat_target(source, "subfolder", subfolder).parent
+                    )
+                    if folder in seen:
+                        continue
+                    seen.add(folder)
+                    try:
+                        relative = Path(folder).relative_to(plan.root)
+                        suffix = " ".join(relative.parts)
+                    except ValueError:
+                        suffix = subfolder
+                    generated.append((folder, suffix, True))
+
+            thread = QtCore.QThread()
+            worker = PrepareWorker(plan, self._settings)
+            worker.moveToThread(thread)
+            thread.started.connect(worker.run)
+            worker.problem.connect(self._prepare_problem)
+            worker.progress.connect(self._job_progress)
+            worker.finished.connect(self._prepare_finished)
+            worker.finished.connect(thread.quit)
+            worker.finished.connect(worker.deleteLater)
+            thread.finished.connect(thread.deleteLater)
+            thread.finished.connect(lambda thread=thread: self._thread_finished(thread))
+            _ACTIVE_THREADS.add(thread)
+            self._thread = thread
+            self._worker = worker
+            self._job_kind = "prepare"
+            self._generation_errors = 0
+            self._prepare_context = {
+                "parent_path": plan.root,
+                "add_roots": bool(add_roots),
+                "generated": generated,
+                "description": description,
+            }
+            self.progress.setRange(0, plan.total)
+            self.progress.setValue(0)
+            self._set_job_controls(True)
+            self.status.setText(
+                "{}: running {} queued operation{}…".format(
+                    description, plan.total, "" if plan.total == 1 else "s"
+                )
+            )
+            thread.start()
+
         def _start_generation(self):
             if self._thread is not None:
                 return
@@ -1315,6 +1605,7 @@ if QtCore is not None:
                     "thumbnails": "thumbnail",
                     "rat": "RAT",
                     "lowres": "low-res",
+                    "prepare": "library-preparation",
                 }.get(self._job_kind, "texture")
                 self.status.setText(
                     "Cancelling pending and active {} conversions…".format(job)
@@ -1410,6 +1701,65 @@ if QtCore is not None:
             self._set_job_controls(False)
             self._worker = None
             self._job_kind = None
+
+        def _prepare_problem(self, source, message):
+            self._generation_errors += 1
+            concise = message.splitlines()[-1] if message else "unknown error"
+            name = os.path.basename(source) if source else "preparation worker"
+            self.status.setText("Failed {}: {}".format(name, concise))
+
+        def _prepare_finished(self, cancelled, summary):
+            context = self._prepare_context or {}
+            added = []
+            if context.get("add_roots"):
+                parent = self._root_by_path(context.get("parent_path", ""))
+                if parent is not None:
+                    folders = []
+                    for path, suffix, rat_only in context.get("generated", ()):
+                        if not os.path.isdir(path):
+                            continue
+                        folders.append(
+                            (
+                                path,
+                                suffix,
+                                prepare.folder_is_rat_only(path)
+                                if rat_only is None
+                                else rat_only,
+                            )
+                        )
+                    added = prepare.generated_root_entries(
+                        self._root_entries(), parent, folders
+                    )
+                    if added:
+                        self._root_entries().extend(added)
+                        self._save()
+                        self._rebuild_root_settings()
+                        self._rebuild_locations()
+
+            if cancelled:
+                message = "Library preparation cancelled ({}/{})".format(
+                    summary.completed, self.progress.maximum()
+                )
+            else:
+                message = (
+                    "Library preparation complete: {} converted, {} resized, "
+                    "{} skipped, {} failed"
+                ).format(
+                    summary.converted,
+                    summary.resized,
+                    summary.skipped,
+                    summary.failed,
+                )
+            if added:
+                message += "; added {} folder{}".format(
+                    len(added), "" if len(added) == 1 else "s"
+                )
+            self._populate_grid()
+            self.status.setText(message)
+            self._set_job_controls(False)
+            self._worker = None
+            self._job_kind = None
+            self._prepare_context = None
 
         def _thread_finished(self, thread):
             _ACTIVE_THREADS.discard(thread)

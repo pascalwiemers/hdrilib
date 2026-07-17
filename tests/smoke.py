@@ -20,7 +20,7 @@ PYTHON_ROOT = REPO_ROOT / "python"
 if str(PYTHON_ROOT) not in sys.path:
     sys.path.insert(0, str(PYTHON_ROOT))
 
-from hdrilib import config, convert, files, resize, resolution, thumbs  # noqa: E402
+from hdrilib import config, convert, files, prepare, resize, resolution, thumbs  # noqa: E402
 from hdrilib.houdini import executable as houdini_executable  # noqa: E402
 import hdrilib.panel as panel  # noqa: E402
 
@@ -47,7 +47,13 @@ def environmental_tool_failure(error):
     message = str(error).lower()
     return any(
         text in message
-        for text in ("license", "could not connect to server", "incompatible processor", "neon")
+        for text in (
+            "license",
+            "could not connect to server",
+            "incompatible processor",
+            "neon",
+            "could not find $hfs/bin",
+        )
     )
 
 
@@ -364,6 +370,130 @@ def main(argv=None) -> int:
         assert too_small == ["4k", "small"]
         print("LOW-RES LOGIC ok: rungs, suffix/subfolder naming, multi-file skips")
 
+        prepare_root = work / "prepare-root"
+        nested = prepare_root / "nested"
+        nested.mkdir(parents=True)
+        large = nested / "large.exr"
+        small = prepare_root / "small.hdr"
+        large.touch()
+        small.touch()
+        plan = prepare.build_pipeline_plan(
+            prepare_root,
+            [large, small, large],
+            convert_to_rat=True,
+            rungs=(4096, 2048),
+            widths={str(large): 9000, str(small): 1500},
+        )
+        assert plan.sources == (str(large), str(small))
+        assert plan.rungs == (4096, 2048)
+        assert plan.resize_stages[0].sources == (str(large),)
+        assert plan.resize_stages[0].targets == (
+            str(prepare_root / "4k" / "nested" / "large.exr"),
+        )
+        assert plan.resize_stages[1].sources == (str(large),)
+        assert plan.total == 6  # two originals + two resizes + two generated RATs
+        assert prepare.sensible_rungs(
+            [large, small], {str(large): (9000, 4500), str(small): None}
+        ) == prepare.PREPARE_RUNGS
+
+        parent_root = {
+            "path": str(prepare_root),
+            "label": "Studio",
+            "color": "#123456",
+            "extensions": [".exr", ".hdr"],
+        }
+        generated = prepare.generated_root_entries(
+            [parent_root, {"path": str(prepare_root / "4k")}],
+            parent_root,
+            [
+                (prepare_root / "4k", "4k", False),
+                (prepare_root / "2k", "2k", False),
+                (prepare_root / "rat", "rat", True),
+                (prepare_root / "2k", "duplicate", True),
+            ],
+        )
+        assert generated == [
+            {
+                "path": str(prepare_root / "2k"),
+                "label": "Studio 2k",
+                "color": "#123456",
+                "extensions": [".exr", ".hdr"],
+            },
+            {
+                "path": str(prepare_root / "rat"),
+                "label": "Studio rat",
+                "color": "#123456",
+                "extensions": [".rat"],
+            },
+        ]
+        generated_4k = prepare_root / "4k"
+        generated_4k.mkdir()
+        (generated_4k / "old.exr").touch()
+        scanned = prepare.scan_root(parent_root)
+        assert str(large) in scanned and str(small) in scanned
+        assert str(generated_4k / "old.exr") not in scanned
+
+        original_parallel_rat = convert.convert_to_rat_parallel
+        original_parallel_resize = resize.resize_to_rung_parallel
+        pipeline_calls = []
+        pipeline_progress = []
+
+        def fake_rat(paths, **kwargs):
+            values = list(paths)
+            pipeline_calls.append(("rat", tuple(values)))
+            for index, value in enumerate(values, 1):
+                kwargs["on_result"](value, value + ".rat")
+                kwargs["on_progress"](index, len(values))
+            return len(values), len(values), False
+
+        def fake_resize(paths, width, **kwargs):
+            values = list(paths)
+            pipeline_calls.append(("resize", width, tuple(values)))
+            for index, value in enumerate(values, 1):
+                target = resize.build_resize_target(
+                    value,
+                    width,
+                    "subfolder",
+                    source_root=kwargs["source_root"],
+                    output_root=kwargs["output_root"],
+                )
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.touch()
+                kwargs["on_result"](
+                    value,
+                    resize.ResizeResult(value, (str(target),), "resized"),
+                )
+                kwargs["on_progress"](index, len(values))
+            return len(values), len(values), False
+
+        convert.convert_to_rat_parallel = fake_rat
+        resize.resize_to_rung_parallel = fake_resize
+        try:
+            summary, cancelled = prepare.run_pipeline(
+                plan,
+                workers=2,
+                on_progress=lambda current, total: pipeline_progress.append(
+                    (current, total)
+                ),
+            )
+        finally:
+            convert.convert_to_rat_parallel = original_parallel_rat
+            resize.resize_to_rung_parallel = original_parallel_resize
+        assert not cancelled
+        assert [call[0] for call in pipeline_calls] == [
+            "rat",
+            "resize",
+            "resize",
+            "rat",
+        ]
+        assert summary.converted == 4 and summary.resized == 2
+        assert summary.completed == plan.total == 6
+        assert pipeline_progress[-1] == (6, 6)
+        print(
+            "PREPARE LOGIC ok: plan/queue, root-level targets, "
+            "auto-add inheritance/dedupe"
+        )
+
         rat_files = files.scan_files(source, extensions=[".rat"], recursive=True)
         hdr_files = files.scan_files(source, extensions=[".hdr"], recursive=True)
         assert rat_files and hdr_files, "extension-filtered scan did not find RAT and HDR inputs"
@@ -401,22 +531,24 @@ def main(argv=None) -> int:
         # Force the primary backend so this specifically verifies imaketx, rather
         # than allowing the normal iconvert compatibility fallback.
         imaketx = houdini_executable("imaketx")
-        assert imaketx, "could not find $HFS/bin/imaketx"
-        imaketx_source = work / "imaketx-input.hdr"
-        shutil.copy2(hdr_files[0], imaketx_source)
-        try:
-            imaketx_result = convert.convert_to_rat(
-                imaketx_source, overwrite=True, executable=imaketx
-            )
-            assert not imaketx_result.skipped
-            assert Path(imaketx_result.target).is_file()
-            assert Path(imaketx_result.target).stat().st_size > 0
-            print("IMAKETX RAT REAL ok: {}".format(imaketx_result.target))
-        except Exception as error:
-            if environmental_tool_failure(error):
-                print("IMAKETX RAT REAL environmental skip: {}".format(error))
-            else:
-                raise
+        if not imaketx:
+            print("IMAKETX RAT REAL environmental skip: could not find $HFS/bin/imaketx")
+        else:
+            imaketx_source = work / "imaketx-input.hdr"
+            shutil.copy2(hdr_files[0], imaketx_source)
+            try:
+                imaketx_result = convert.convert_to_rat(
+                    imaketx_source, overwrite=True, executable=imaketx
+                )
+                assert not imaketx_result.skipped
+                assert Path(imaketx_result.target).is_file()
+                assert Path(imaketx_result.target).stat().st_size > 0
+                print("IMAKETX RAT REAL ok: {}".format(imaketx_result.target))
+            except Exception as error:
+                if environmental_tool_failure(error):
+                    print("IMAKETX RAT REAL environmental skip: {}".format(error))
+                else:
+                    raise
 
         # Deterministically verify that cancellation does not drain the executor's
         # entire input queue. Real converters also receive the same event and are
