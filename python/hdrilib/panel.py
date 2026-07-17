@@ -12,7 +12,7 @@ import time
 from collections import deque
 from pathlib import Path
 
-from . import assign, config, convert, files, prepare, resize, resolution, thumbs
+from . import assign, config, convert, files, prepare, resize, resolution, thumbs, variants
 
 try:
     from hutil.Qt import QtCore, QtGui, QtWidgets
@@ -81,6 +81,7 @@ if QtCore is not None:
     USER_ROLE = _enum(QtCore.Qt, "ItemDataRole", "UserRole")
     TOOLTIP_ROLE = _enum(QtCore.Qt, "ItemDataRole", "ToolTipRole")
     ROOT_ROLE = _enum_value(USER_ROLE) + 1
+    GROUP_ROLE = _enum_value(USER_ROLE) + 2
     ALIGN_CENTER = _enum(QtCore.Qt, "AlignmentFlag", "AlignCenter")
     HORIZONTAL = _enum(QtCore.Qt, "Orientation", "Horizontal")
     ICON_MODE = _enum(QtWidgets.QListView, "ViewMode", "IconMode")
@@ -381,6 +382,11 @@ if QtCore is not None:
                 format_menu.addAction(action)
                 self._format_actions[extension] = action
             self.format_button.setMenu(format_menu)
+            self.group_resolutions = QtWidgets.QCheckBox("Group resolutions")
+            self.group_resolutions.setToolTip(
+                "Show one entry per HDRI, combining _1k/_4k… suffix and rung-"
+                "subfolder variants. Hover an entry to see its files."
+            )
             self.view_mode_combo = QtWidgets.QComboBox()
             self.view_mode_combo.addItems(["Grid", "List"])
             self.view_mode_combo.setToolTip("Switch between thumbnail grid and compact list")
@@ -394,6 +400,7 @@ if QtCore is not None:
             )
             filter_bar.addWidget(self.search, 1)
             filter_bar.addWidget(self.include_subfolders)
+            filter_bar.addWidget(self.group_resolutions)
             filter_bar.addWidget(self.format_button)
             filter_bar.addWidget(self.view_mode_combo)
             filter_bar.addWidget(self.icon_size_slider)
@@ -428,6 +435,7 @@ if QtCore is not None:
             self.grid.customContextMenuRequested.connect(self._show_grid_context_menu)
             self.generate_button.clicked.connect(self._start_generation)
             self.cancel_button.clicked.connect(self._cancel_job)
+            self.group_resolutions.toggled.connect(self._grouping_changed)
             self.view_mode_combo.currentIndexChanged.connect(self._view_mode_changed)
             self.icon_size_slider.valueChanged.connect(self._display_size_changed)
             self.icon_size_slider.sliderReleased.connect(self._save)
@@ -496,9 +504,25 @@ if QtCore is not None:
                 " Changing this regenerates thumbnails on demand."
             )
             self.clear_thumbs_button = QtWidgets.QPushButton("Clear thumbnail cache")
+            self.assign_resolution_combo = QtWidgets.QComboBox()
+            self.assign_resolution_combo.addItem("Highest resolution", "highest")
+            self.assign_resolution_combo.addItem("Lowest resolution", "lowest")
+            for width, label in (
+                (1024, "1K"),
+                (2048, "2K"),
+                (4096, "4K"),
+                (8192, "8K"),
+                (16384, "16K"),
+            ):
+                self.assign_resolution_combo.addItem("Closest to " + label, str(width))
+            self.assign_resolution_combo.setToolTip(
+                "Which resolution variant a double-click assigns when"
+                " \"Group resolutions\" is on."
+            )
             thumbnail_layout.addRow("Preview size", self.thumbnail_size_spin)
             thumbnail_layout.addRow("Parallel workers", self.thumbnail_workers_spin)
             thumbnail_layout.addRow("Tone mapping", self.thumbnail_tonemap_combo)
+            thumbnail_layout.addRow("Double-click assigns", self.assign_resolution_combo)
             thumbnail_layout.addRow("", self.clear_thumbs_button)
             options_grid.addWidget(thumbnail_group, 0, 1)
 
@@ -561,6 +585,9 @@ if QtCore is not None:
             self.thumbnail_tonemap_combo.currentIndexChanged.connect(
                 self._thumbnail_settings_changed
             )
+            self.assign_resolution_combo.currentIndexChanged.connect(
+                self._thumbnail_settings_changed
+            )
             self.clear_thumbs_button.clicked.connect(self._clear_thumbnail_cache)
             self.rat_alongside_radio.toggled.connect(self._rat_settings_changed)
             self.rat_subfolder_radio.toggled.connect(self._rat_settings_changed)
@@ -594,6 +621,21 @@ if QtCore is not None:
                 1 if self._settings.get("thumbnail_tonemap") == "aces" else 0
             )
             self.thumbnail_tonemap_combo.blockSignals(False)
+            self.assign_resolution_combo.blockSignals(True)
+            self.assign_resolution_combo.setCurrentIndex(
+                max(
+                    0,
+                    self.assign_resolution_combo.findData(
+                        self._settings.get("assign_resolution", variants.DEFAULT_ASSIGN)
+                    ),
+                )
+            )
+            self.assign_resolution_combo.blockSignals(False)
+            self.group_resolutions.blockSignals(True)
+            self.group_resolutions.setChecked(
+                bool(self._settings.get("group_resolutions", False))
+            )
+            self.group_resolutions.blockSignals(False)
             self.view_mode_combo.blockSignals(True)
             self.view_mode_combo.setCurrentIndex(
                 1 if self._settings.get("view_mode") == "list" else 0
@@ -657,6 +699,11 @@ if QtCore is not None:
                 self.grid.setSpacing(6)
                 self.grid.setIconSize(QtCore.QSize(size, max(32, size // 2)))
                 self.grid.setGridSize(QtCore.QSize(size + 24, max(100, size // 2 + 48)))
+
+        def _grouping_changed(self, checked):
+            self._settings["group_resolutions"] = bool(checked)
+            self._save()
+            self._populate_grid()
 
         def _view_mode_changed(self, index):
             self._settings["view_mode"] = "list" if index == 1 else "grid"
@@ -1525,6 +1572,9 @@ if QtCore is not None:
             self._settings["thumbnail_tonemap"] = (
                 self.thumbnail_tonemap_combo.currentData() or thumbs.DEFAULT_TONEMAP
             )
+            self._settings["assign_resolution"] = (
+                self.assign_resolution_combo.currentData() or variants.DEFAULT_ASSIGN
+            )
             self._save()
             self._apply_icon_size()
             self._populate_grid()
@@ -1613,34 +1663,155 @@ if QtCore is not None:
             size = int(self._settings.get("thumbnail_size", 256))
             tonemap = self._settings.get("thumbnail_tonemap", thumbs.DEFAULT_TONEMAP)
             center_text = self._settings.get("view_mode", "grid") != "list"
-            for path in visible:
-                item = QtWidgets.QListWidgetItem(os.path.basename(path))
+
+            def make_item(text, tooltip, assign_path, icon_paths, group_paths=None):
+                item = QtWidgets.QListWidgetItem(text)
                 if center_text:
                     item.setTextAlignment(ALIGN_CENTER)
-                item.setToolTip(path)
-                item.setData(USER_ROLE, path)
-                cached = thumbs.cached_thumbnail(path, size=size, tonemap=tonemap)
+                item.setToolTip(tooltip)
+                item.setData(USER_ROLE, assign_path)
+                if group_paths:
+                    item.setData(GROUP_ROLE, group_paths)
+                cached = None
+                for candidate in icon_paths:
+                    cached = thumbs.cached_thumbnail(candidate, size=size, tonemap=tonemap)
+                    if cached:
+                        break
                 item.setIcon(QtGui.QIcon(cached) if cached else fallback_icon)
                 self.grid.addItem(item)
-            self.status.setText(
-                "{} texture{}".format(len(visible), "" if len(visible) == 1 else "s")
-            )
+
+            if self._settings.get("group_resolutions", False):
+                groups = variants.build_groups(visible)
+                for group in groups:
+                    lines = []
+                    for variant in group.variants:
+                        lines.append("{}: {}".format(variant.label, variant.path))
+                        lines.extend("rat: {}".format(c) for c in variant.companions)
+                    single = len(group.variants) == 1
+                    text = (
+                        os.path.basename(group.variants[0].path)
+                        if single
+                        else "{} ({})".format(group.name, group.badge())
+                    )
+                    # Smallest variant renders fastest and shows identical pixels.
+                    icon_order = sorted(
+                        group.variants,
+                        key=lambda variant: variants.token_width(variant.token)
+                        or (1 << 30),
+                    )
+                    make_item(
+                        text,
+                        "\n".join(lines),
+                        group.variants[0].path,
+                        [variant.path for variant in icon_order],
+                        group_paths=group.paths,
+                    )
+                self.status.setText(
+                    "{} HDRI{} ({} file{})".format(
+                        len(groups),
+                        "" if len(groups) == 1 else "s",
+                        len(visible),
+                        "" if len(visible) == 1 else "s",
+                    )
+                )
+            else:
+                for path in visible:
+                    make_item(os.path.basename(path), path, path, [path])
+                self.status.setText(
+                    "{} texture{}".format(len(visible), "" if len(visible) == 1 else "s")
+                )
 
         def _assign_item(self, item):
-            result = assign.assign_texture(item.data(USER_ROLE))
-            self.status.setText(result.message)
+            group_paths = item.data(GROUP_ROLE)
+            target = item.data(USER_ROLE)
+            if group_paths and len(group_paths) > 1:
+                group = next(
+                    (g for g in variants.build_groups(group_paths) if len(g.variants) > 1),
+                    None,
+                )
+                if group is not None:
+                    widths = {}
+                    for path in group.paths:
+                        dimensions = resolution.probe_fast(path)
+                        if dimensions is not None:
+                            widths[path] = dimensions[0]
+                    target = variants.pick_variant(
+                        group,
+                        self._settings.get("assign_resolution", variants.DEFAULT_ASSIGN),
+                        widths,
+                    ).path
+            self._assign_path(target)
+
+        def _copy_path(self, path):
+            clipboard = QtWidgets.QApplication.clipboard()
+            if clipboard is not None:
+                clipboard.setText(path)
+            self.status.setText("Copied {}".format(path))
+
+        def _assign_path(self, path):
+            result = assign.assign_texture(path)
+            # Always echo the concrete file so resolution picks are never silent.
+            self.status.setText(
+                "{} — {}".format(os.path.basename(path), result.message)
+            )
 
         def _show_grid_context_menu(self, position):
             clicked = self.grid.itemAt(position)
             if clicked is not None and not clicked.isSelected():
                 self.grid.clearSelection()
                 clicked.setSelected(True)
-            selected = [
-                item.data(USER_ROLE)
-                for item in self.grid.selectedItems()
-                if item.data(USER_ROLE)
-            ]
+            selected = []
+            for entry in self.grid.selectedItems():
+                group_paths = entry.data(GROUP_ROLE)
+                for value in group_paths or ([entry.data(USER_ROLE)] if entry.data(USER_ROLE) else []):
+                    if value not in selected:
+                        selected.append(value)
             menu = QtWidgets.QMenu(self.grid)
+            if clicked is not None:
+                clicked_paths = clicked.data(GROUP_ROLE) or (
+                    [clicked.data(USER_ROLE)] if clicked.data(USER_ROLE) else []
+                )
+                entries = []
+                for group in variants.build_groups(clicked_paths):
+                    for variant in group.variants:
+                        entries.append(
+                            (
+                                "{} — {}".format(
+                                    variant.label, os.path.basename(variant.path)
+                                ),
+                                variant.path,
+                            )
+                        )
+                        entries.extend(
+                            (
+                                "{} rat — {}".format(
+                                    variant.label, os.path.basename(companion)
+                                ),
+                                companion,
+                            )
+                            for companion in variant.companions
+                        )
+                if len(entries) > 1:
+                    assign_menu = menu.addMenu("Assign Resolution")
+                    copy_menu = menu.addMenu("Copy Path")
+                    for label, path in entries:
+                        assign_action = QAction(label, assign_menu)
+                        assign_action.triggered.connect(
+                            lambda _checked=False, value=path: self._assign_path(value)
+                        )
+                        assign_menu.addAction(assign_action)
+                        copy_action = QAction(label, copy_menu)
+                        copy_action.triggered.connect(
+                            lambda _checked=False, value=path: self._copy_path(value)
+                        )
+                        copy_menu.addAction(copy_action)
+                elif entries:
+                    copy_action = QAction("Copy Path", menu)
+                    copy_action.triggered.connect(
+                        lambda _checked=False, value=entries[0][1]: self._copy_path(value)
+                    )
+                    menu.addAction(copy_action)
+                menu.addSeparator()
             action = QAction("Convert to .rat", menu)
             action.setEnabled(bool(selected) and self._thread is None)
             action.triggered.connect(

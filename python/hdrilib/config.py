@@ -37,6 +37,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "display_icon_size": 256,
     "view_mode": "grid",
     "thumbnail_tonemap": "neutral",
+    "group_resolutions": False,
+    "assign_resolution": "highest",
     "rat_output_mode": "alongside",
     "rat_subfolder_name": "rat",
     "rat_overwrite_existing": False,
@@ -189,6 +191,14 @@ def normalise_config(data: Mapping[str, Any] | None) -> dict[str, Any]:
     tonemap = data.get("thumbnail_tonemap")
     if tonemap in ("neutral", "aces"):
         result["thumbnail_tonemap"] = tonemap
+
+    group_resolutions = data.get("group_resolutions")
+    if isinstance(group_resolutions, bool):
+        result["group_resolutions"] = group_resolutions
+
+    assign_resolution = data.get("assign_resolution")
+    if assign_resolution in ("highest", "lowest", "1024", "2048", "4096", "8192", "16384"):
+        result["assign_resolution"] = assign_resolution
 
     rat_output_mode = data.get("rat_output_mode")
     if rat_output_mode in ("alongside", "subfolder"):

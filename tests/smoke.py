@@ -20,7 +20,7 @@ PYTHON_ROOT = REPO_ROOT / "python"
 if str(PYTHON_ROOT) not in sys.path:
     sys.path.insert(0, str(PYTHON_ROOT))
 
-from hdrilib import config, convert, files, prepare, resize, resolution, thumbs  # noqa: E402
+from hdrilib import config, convert, files, prepare, resize, resolution, thumbs, variants  # noqa: E402
 from hdrilib.houdini import executable as houdini_executable  # noqa: E402
 import hdrilib.panel as panel  # noqa: E402
 
@@ -376,6 +376,30 @@ def main(argv=None) -> int:
         assert [Path(path).suffix for path in scans[0]] == [".rat"]
         assert {Path(path).suffix for path in scans[1]} == {".rat", ".hdr"}
         print("CONFIG ok: v1/v2 migration, strict v8 normalization, round trip")
+
+        groups = variants.build_groups(
+            [
+                "/lib/church_8k.hdr",
+                "/lib/church_4k.hdr",
+                "/lib/studio.exr",
+                "/lib/studio_1k.exr",
+                "/lib/studio.exr.rat",
+                "/lib/1k/forest.exr",
+                "/lib/forest.exr",
+                "/lib/sunset_01.exr",
+                "/lib/sunset_02.exr",
+            ]
+        )
+        by_name = {group.name: group for group in groups}
+        assert [v.label for v in by_name["church"].variants] == ["8k", "4k"]
+        assert [v.label for v in by_name["studio"].variants] == ["native", "1k"]
+        assert by_name["studio"].variants[0].companions == ["/lib/studio.exr.rat"]
+        assert [v.label for v in by_name["forest"].variants] == ["native", "1k"]
+        assert len(by_name["sunset_01"].variants) == 1
+        assert variants.pick_variant(by_name["church"], "highest").label == "8k"
+        assert variants.pick_variant(by_name["church"], "1024").label == "4k"
+        assert variants.pick_variant(by_name["studio"], "lowest").label == "1k"
+        print("VARIANTS ok: suffix/rung-subfolder grouping, rat companions, picks")
         print("PER-ROOT SCAN ok: RAT-only root differs from all-formats root")
 
         target_source = work / "targets" / "sunset.exr"
