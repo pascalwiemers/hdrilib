@@ -132,6 +132,31 @@ def hoiiotool_fallback_command(
     ]
 
 
+_RAT_SIBLING_EXTENSIONS = (".exr", ".hdr", ".png", ".jpg", ".jpeg", ".tif", ".tiff")
+
+
+def rat_sibling_source(path: Path) -> Path | None:
+    """Return the RAT's original image when it sits nearby.
+
+    Reading RAT through iconvert checks out a Houdini license; the original
+    holds the same pixels, so prefer it. Covers ``foo.exr.rat`` alongside and
+    the ``rat/`` subfolder layout (original one directory up).
+    """
+
+    stem = path.name[: -len(".rat")]
+    names = [stem] if "." in stem else []
+    names.extend(stem + extension for extension in _RAT_SIBLING_EXTENSIONS)
+    for directory in (path.parent, path.parent.parent):
+        for name in names:
+            candidate = directory / name
+            try:
+                if candidate.is_file():
+                    return candidate
+            except OSError:
+                continue
+    return None
+
+
 def _looks_like_ocio_failure(detail: str) -> bool:
     message = detail.lower()
     return "ocio" in message or "color space" in message or "colorconfig" in message
@@ -210,7 +235,17 @@ def generate_thumbnail(
         try:
             os.unlink(temporary_name)
             conversion_source = source_path
-            if source_path.name.lower().endswith(".rat"):
+            sibling = (
+                rat_sibling_source(source_path)
+                if source_path.name.lower().endswith(".rat")
+                else None
+            )
+            if sibling is not None:
+                conversion_source = sibling
+                dimensions = resolution.probe_fast(conversion_source)
+                if dimensions is not None:
+                    resolution.store(source_path, *dimensions)
+            elif source_path.name.lower().endswith(".rat"):
                 if not iconvert:
                     raise ThumbnailError("RAT conversion requires $HFS/bin/iconvert")
                 bridge_fd, bridge_name = tempfile.mkstemp(

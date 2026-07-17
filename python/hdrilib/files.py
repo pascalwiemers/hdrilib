@@ -8,6 +8,18 @@ from typing import Iterable, Iterator
 
 from .config import DEFAULT_EXTENSIONS
 
+# NAS/system metadata folders that hold fake image files (Synology thumbnails,
+# recycle bins, Substance .alg_meta, macOS AppleDouble companions).
+_SKIP_DIRECTORIES = {"@eadir", "@recycle", "#recycle", "@tmp", "$recycle.bin"}
+
+
+def _wanted_directory(name: str) -> bool:
+    return not name.startswith(".") and name.lower() not in _SKIP_DIRECTORIES
+
+
+def _wanted_file(name: str) -> bool:
+    return not name.startswith(".")
+
 
 def normalise_extensions(extensions: Iterable[str] | None) -> tuple[str, ...]:
     values = DEFAULT_EXTENSIONS if extensions is None else extensions
@@ -46,11 +58,28 @@ def iter_files(
     root = Path(folder).expanduser()
     if not root.is_dir():
         return
+    if recursive:
+        for current, directories, names in os.walk(root, onerror=lambda _error: None):
+            directories[:] = [name for name in directories if _wanted_directory(name)]
+            for name in names:
+                if not _wanted_file(name) or not matches_extension(name, extensions):
+                    continue
+                path = Path(current) / name
+                try:
+                    if path.is_file():
+                        yield str(path.resolve())
+                except OSError:
+                    continue
+        return
     try:
-        iterator = root.rglob("*") if recursive else root.iterdir()
+        iterator = root.iterdir()
         for path in iterator:
             try:
-                if path.is_file() and matches_extension(path.name, extensions):
+                if (
+                    _wanted_file(path.name)
+                    and path.is_file()
+                    and matches_extension(path.name, extensions)
+                ):
                     yield str(path.resolve())
             except OSError:
                 continue
@@ -82,7 +111,7 @@ def iter_folders(root: str | os.PathLike[str]) -> Iterator[str]:
     yield str(root_path.resolve())
     for current, directories, _files in os.walk(root_path):
         directories[:] = sorted(
-            (directory for directory in directories if not directory.startswith(".")),
+            (directory for directory in directories if _wanted_directory(directory)),
             key=str.lower,
         )
         for directory in directories:
