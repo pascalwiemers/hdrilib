@@ -12,7 +12,18 @@ import time
 from collections import deque
 from pathlib import Path
 
-from . import assign, config, convert, files, prepare, resize, resolution, thumbs, variants
+from . import (
+    analyze,
+    assign,
+    config,
+    convert,
+    files,
+    prepare,
+    resize,
+    resolution,
+    thumbs,
+    variants,
+)
 
 try:
     from hutil.Qt import QtCore, QtGui, QtWidgets
@@ -37,6 +48,14 @@ def _format_duration(seconds):
         return "{}m {}s".format(minutes, seconds)
     hours, minutes = divmod(minutes, 60)
     return "{}h {}m".format(hours, minutes)
+
+
+def _format_bytes(value):
+    size = float(max(0, value))
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024.0 or unit == "TB":
+            return "{:.0f} {}".format(size, unit) if unit == "B" else "{:.1f} {}".format(size, unit)
+        size /= 1024.0
 
 
 if QtCore is not None:
@@ -111,6 +130,33 @@ if QtCore is not None:
             if index.column() != 1:
                 return None
             return super().createEditor(parent, option, index)
+
+
+    class FolderDropEdit(QtWidgets.QLineEdit):
+        """Folder field that accepts a directory dragged from the desktop."""
+
+        folder_dropped = Signal(str)
+
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.setAcceptDrops(True)
+
+        def dragEnterEvent(self, event):
+            urls = event.mimeData().urls() if event.mimeData().hasUrls() else []
+            if any(url.isLocalFile() and os.path.isdir(url.toLocalFile()) for url in urls):
+                event.acceptProposedAction()
+            else:
+                super().dragEnterEvent(event)
+
+        def dropEvent(self, event):
+            for url in event.mimeData().urls():
+                path = url.toLocalFile()
+                if path and os.path.isdir(path):
+                    self.setText(os.path.abspath(path))
+                    self.folder_dropped.emit(os.path.abspath(path))
+                    event.acceptProposedAction()
+                    return
+            super().dropEvent(event)
 
 
     class ThumbnailWorker(QtCore.QObject):
@@ -306,6 +352,8 @@ if QtCore is not None:
             self._generation_errors = 0
             self._conversion_skipped = 0
             self._prepare_context = None
+            self._import_analysis = None
+            self._import_plan = None
             self._progress_label = "Processing"
             self._progress_last_time = 0.0
             self._progress_last_count = 0
@@ -327,8 +375,10 @@ if QtCore is not None:
             outer.addWidget(self.tabs)
 
             self.browse_tab = QtWidgets.QWidget()
+            self.import_tab = QtWidgets.QWidget()
             self.settings_tab = QtWidgets.QWidget()
             self.tabs.addTab(self.browse_tab, "Browse")
+            self.tabs.addTab(self.import_tab, "Import")
             self.tabs.addTab(self.settings_tab, "Settings")
 
             # The job bar lives outside the tabs so progress from jobs started
@@ -336,22 +386,23 @@ if QtCore is not None:
             # always visible.
             generation_bar = QtWidgets.QHBoxLayout()
             self.generate_button = QtWidgets.QPushButton("Generate thumbnails")
+            self.generate_button.setVisible(False)
             self.cancel_button = QtWidgets.QPushButton("Cancel")
             self.cancel_button.setEnabled(False)
             self.progress = QtWidgets.QProgressBar()
             self.progress.setTextVisible(True)
             self.progress.setRange(0, 1)
             self.progress.setValue(0)
-            generation_bar.addWidget(self.generate_button)
             generation_bar.addWidget(self.cancel_button)
             generation_bar.addWidget(self.progress, 1)
             outer.addLayout(generation_bar)
 
-            self.status = QtWidgets.QLabel("Add an HDRI root in Settings to begin.")
+            self.status = QtWidgets.QLabel("Add your first HDRI folder to begin.")
             self.status.setWordWrap(True)
             outer.addWidget(self.status)
 
             self._build_browse_tab()
+            self._build_import_tab()
             self._build_settings_tab()
 
         def _build_browse_tab(self):
@@ -363,13 +414,16 @@ if QtCore is not None:
             self.location_combo = QtWidgets.QComboBox()
             self.location_combo.setMinimumWidth(220)
             self.refresh_button = QtWidgets.QPushButton("Refresh")
-            self.convert_folder_button = QtWidgets.QPushButton("Convert folder to .rat")
-            self.lowres_folder_button = QtWidgets.QPushButton("Create low-res…")
+            # Kept as private compatibility handles for old host scripts; guided
+            # import owns these actions now and the buttons are intentionally hidden.
+            self.convert_folder_button = QtWidgets.QPushButton()
+            self.lowres_folder_button = QtWidgets.QPushButton()
+            self.convert_folder_button.setVisible(False)
+            self.lowres_folder_button.setVisible(False)
             toolbar.addWidget(self.location_label)
             toolbar.addWidget(self.location_combo, 1)
+            toolbar.addStretch(1)
             toolbar.addWidget(self.refresh_button)
-            toolbar.addWidget(self.convert_folder_button)
-            toolbar.addWidget(self.lowres_folder_button)
             layout.addLayout(toolbar)
 
             filter_bar = QtWidgets.QHBoxLayout()
@@ -429,8 +483,22 @@ if QtCore is not None:
             filter_bar.addWidget(self.browse_assign_resolution_combo)
             filter_bar.addWidget(self.format_button)
             filter_bar.addWidget(self.view_mode_combo)
-            filter_bar.addWidget(self.icon_size_slider)
             layout.addLayout(filter_bar)
+
+            self.browse_empty = QtWidgets.QWidget()
+            empty_layout = QtWidgets.QVBoxLayout(self.browse_empty)
+            empty_layout.addStretch(1)
+            empty_title = QtWidgets.QLabel("Your HDRI library is ready for its first folder.")
+            empty_title.setAlignment(ALIGN_CENTER)
+            empty_title.setWordWrap(True)
+            self.browse_empty_button = QtWidgets.QPushButton(
+                "Add your first HDRI folder…"
+            )
+            self.browse_empty_button.setMaximumWidth(280)
+            empty_layout.addWidget(empty_title)
+            empty_layout.addWidget(self.browse_empty_button, 0, ALIGN_CENTER)
+            empty_layout.addStretch(1)
+            layout.addWidget(self.browse_empty, 1)
 
             self.splitter = QtWidgets.QSplitter(HORIZONTAL)
             self.folder_tree = QtWidgets.QTreeWidget()
@@ -472,6 +540,153 @@ if QtCore is not None:
             self.view_mode_combo.currentIndexChanged.connect(self._view_mode_changed)
             self.icon_size_slider.valueChanged.connect(self._display_size_changed)
             self.icon_size_slider.sliderReleased.connect(self._save)
+            self.browse_empty_button.clicked.connect(self._open_import_picker)
+
+        def _build_import_tab(self):
+            layout = QtWidgets.QVBoxLayout(self.import_tab)
+            layout.setContentsMargins(10, 10, 10, 10)
+
+            source_group = QtWidgets.QGroupBox("1 · Point at a folder")
+            source_layout = QtWidgets.QHBoxLayout(source_group)
+            self.import_source_edit = FolderDropEdit()
+            self.import_source_edit.setPlaceholderText(
+                "Choose or drop a folder containing HDRIs"
+            )
+            self.import_source_button = QtWidgets.QPushButton("Choose folder…")
+            source_layout.addWidget(self.import_source_edit, 1)
+            source_layout.addWidget(self.import_source_button)
+            layout.addWidget(source_group)
+
+            analysis_group = QtWidgets.QGroupBox("2 · Analysis")
+            analysis_layout = QtWidgets.QVBoxLayout(analysis_group)
+            self.import_analysis_label = QtWidgets.QLabel(
+                "Choose a folder for an instant, read-only analysis."
+            )
+            self.import_analysis_label.setWordWrap(True)
+            self.import_analysis_label.setTextInteractionFlags(
+                _enum(QtCore.Qt, "TextInteractionFlag", "TextSelectableByMouse")
+            )
+            analysis_layout.addWidget(self.import_analysis_label)
+            layout.addWidget(analysis_group)
+
+            options_group = QtWidgets.QGroupBox("3 · Choose the plan")
+            options_layout = QtWidgets.QVBoxLayout(options_group)
+
+            where_label = QtWidgets.QLabel("Where")
+            where_label.setStyleSheet("font-weight: bold")
+            options_layout.addWidget(where_label)
+            self.import_in_place_radio = QtWidgets.QRadioButton("Organize in place")
+            self.import_copy_radio = QtWidgets.QRadioButton(
+                "Copy into a library location"
+            )
+            self.import_in_place_radio.setChecked(True)
+            options_layout.addWidget(self.import_in_place_radio)
+            in_place_help = QtWidgets.QLabel(
+                "Generated files go into rat/ and 8k/4k/2k/1k folders next to the originals."
+            )
+            in_place_help.setWordWrap(True)
+            options_layout.addWidget(in_place_help)
+            options_layout.addWidget(self.import_copy_radio)
+            copy_help = QtWidgets.QLabel(
+                "Originals are copied first; the source stays read-only and every generated file goes to the destination."
+            )
+            copy_help.setWordWrap(True)
+            options_layout.addWidget(copy_help)
+            destination_row = QtWidgets.QHBoxLayout()
+            self.import_destination_edit = FolderDropEdit()
+            self.import_destination_edit.setPlaceholderText("Library destination folder")
+            self.import_destination_button = QtWidgets.QPushButton("Choose destination…")
+            destination_row.addWidget(self.import_destination_edit, 1)
+            destination_row.addWidget(self.import_destination_button)
+            options_layout.addLayout(destination_row)
+
+            what_label = QtWidgets.QLabel("What to generate")
+            what_label.setStyleSheet("font-weight: bold")
+            options_layout.addWidget(what_label)
+            self.import_generate_rat = QtWidgets.QCheckBox(
+                "Mipmapped .rat versions of originals"
+            )
+            self.import_generate_rat.setChecked(True)
+            options_layout.addWidget(self.import_generate_rat)
+            rat_help = QtWidgets.QLabel(
+                "Adds renderer-ready, mipmapped copies and leaves every original unchanged."
+            )
+            rat_help.setWordWrap(True)
+            options_layout.addWidget(rat_help)
+
+            rung_row = QtWidgets.QHBoxLayout()
+            rung_row.addWidget(QtWidgets.QLabel("Low-res rungs"))
+            self.import_rung_boxes = {}
+            for width in prepare.PREPARE_RUNGS:
+                box = QtWidgets.QCheckBox(resize.rung_label(width).upper())
+                self.import_rung_boxes[width] = box
+                rung_row.addWidget(box)
+            rung_row.addStretch(1)
+            options_layout.addLayout(rung_row)
+            rung_help = QtWidgets.QLabel(
+                "Creates faster browsing and lighting choices only below the source resolution."
+            )
+            rung_help.setWordWrap(True)
+            options_layout.addWidget(rung_help)
+
+            format_row = QtWidgets.QHBoxLayout()
+            format_row.addWidget(QtWidgets.QLabel("Low-res output"))
+            self.import_lowres_format_combo = QtWidgets.QComboBox()
+            self.import_lowres_format_combo.addItem("Native format", "native")
+            self.import_lowres_format_combo.addItem(".rat", "rat")
+            self.import_lowres_format_combo.addItem("Native + .rat", "both")
+            format_row.addWidget(self.import_lowres_format_combo)
+            format_row.addStretch(1)
+            options_layout.addLayout(format_row)
+            self.import_lowres_help = QtWidgets.QLabel()
+            self.import_lowres_help.setWordWrap(True)
+            options_layout.addWidget(self.import_lowres_help)
+
+            self.import_generate_thumbnails = QtWidgets.QCheckBox(
+                "Generate thumbnails"
+            )
+            self.import_generate_thumbnails.setChecked(True)
+            options_layout.addWidget(self.import_generate_thumbnails)
+            thumb_help = QtWidgets.QLabel(
+                "Builds cached previews so the finished folder is visible immediately in Browse."
+            )
+            thumb_help.setWordWrap(True)
+            options_layout.addWidget(thumb_help)
+
+            self.import_summary = QtWidgets.QLabel("Choose a source folder to build a plan.")
+            self.import_summary.setWordWrap(True)
+            self.import_summary.setStyleSheet("font-weight: bold; padding-top: 6px")
+            options_layout.addWidget(self.import_summary)
+            self.import_run_button = QtWidgets.QPushButton("Run import")
+            self.import_run_button.setEnabled(False)
+            options_layout.addWidget(self.import_run_button)
+            layout.addWidget(options_group, 1)
+
+            self.import_source_button.clicked.connect(self._choose_import_source)
+            self.import_source_edit.folder_dropped.connect(self._analyze_import_source)
+            self.import_source_edit.editingFinished.connect(
+                lambda: self._analyze_import_source(self.import_source_edit.text())
+            )
+            self.import_destination_button.clicked.connect(
+                self._choose_import_destination
+            )
+            self.import_destination_edit.folder_dropped.connect(
+                lambda _path: self._import_options_changed()
+            )
+            self.import_destination_edit.textChanged.connect(
+                self._import_options_changed
+            )
+            self.import_copy_radio.toggled.connect(self._import_options_changed)
+            self.import_generate_rat.toggled.connect(self._import_options_changed)
+            self.import_generate_thumbnails.toggled.connect(
+                self._import_options_changed
+            )
+            self.import_lowres_format_combo.currentIndexChanged.connect(
+                self._import_options_changed
+            )
+            for box in self.import_rung_boxes.values():
+                box.toggled.connect(self._import_options_changed)
+            self.import_run_button.clicked.connect(self._start_import)
 
         def _build_settings_tab(self):
             layout = QtWidgets.QVBoxLayout(self.settings_tab)
@@ -491,7 +706,7 @@ if QtCore is not None:
             self.roots_list.setContextMenuPolicy(CUSTOM_CONTEXT_MENU)
             roots_layout.addWidget(self.roots_list)
             root_buttons = QtWidgets.QHBoxLayout()
-            self.settings_add_root = QtWidgets.QPushButton("Add…")
+            self.settings_add_root = QtWidgets.QPushButton("Import folder…")
             self.settings_remove_root = QtWidgets.QPushButton("Remove")
             self.settings_move_up = QtWidgets.QPushButton("Move up")
             self.settings_move_down = QtWidgets.QPushButton("Move down")
@@ -530,6 +745,11 @@ if QtCore is not None:
             self.thumbnail_workers_spin = QtWidgets.QSpinBox()
             self.thumbnail_workers_spin.setRange(1, 64)
             self.thumbnail_workers_spin.setKeyboardTracking(False)
+            self.display_size_spin = QtWidgets.QSpinBox()
+            self.display_size_spin.setRange(48, 512)
+            self.display_size_spin.setSingleStep(16)
+            self.display_size_spin.setSuffix(" px")
+            self.display_size_spin.setKeyboardTracking(False)
             self.thumbnail_tonemap_combo = QtWidgets.QComboBox()
             self.thumbnail_tonemap_combo.addItem("Neutral (soft contrast)", "neutral")
             self.thumbnail_tonemap_combo.addItem("ACES (filmic)", "aces")
@@ -555,12 +775,13 @@ if QtCore is not None:
             )
             thumbnail_layout.addRow("Preview size", self.thumbnail_size_spin)
             thumbnail_layout.addRow("Parallel workers", self.thumbnail_workers_spin)
+            thumbnail_layout.addRow("Browse display size", self.display_size_spin)
             thumbnail_layout.addRow("Tone mapping", self.thumbnail_tonemap_combo)
-            thumbnail_layout.addRow("Double-click assigns", self.assign_resolution_combo)
             thumbnail_layout.addRow("", self.clear_thumbs_button)
             options_grid.addWidget(thumbnail_group, 0, 1)
 
             rat_group = QtWidgets.QGroupBox("RAT Conversion")
+            rat_group.setVisible(False)
             rat_layout = QtWidgets.QFormLayout(rat_group)
             self.rat_alongside_radio = QtWidgets.QRadioButton("Alongside source")
             self.rat_subfolder_radio = QtWidgets.QRadioButton("Source subfolder")
@@ -579,6 +800,7 @@ if QtCore is not None:
             options_grid.addWidget(rat_group, 1, 0)
 
             lowres_group = QtWidgets.QGroupBox("Low-Res Variants")
+            lowres_group.setVisible(False)
             lowres_layout = QtWidgets.QFormLayout(lowres_group)
             self.lowres_alongside_radio = QtWidgets.QRadioButton("Alongside source")
             self.lowres_subfolder_radio = QtWidgets.QRadioButton("Resolution subfolder")
@@ -596,7 +818,7 @@ if QtCore is not None:
             options_grid.addWidget(lowres_group, 1, 1)
             layout.addLayout(options_grid)
 
-            self.settings_add_root.clicked.connect(self._add_root)
+            self.settings_add_root.clicked.connect(self._open_import_picker)
             self.settings_remove_root.clicked.connect(self._remove_root)
             self.settings_move_up.clicked.connect(lambda: self._move_root(-1))
             self.settings_move_down.clicked.connect(lambda: self._move_root(1))
@@ -616,6 +838,9 @@ if QtCore is not None:
             )
             self.thumbnail_size_spin.valueChanged.connect(self._thumbnail_settings_changed)
             self.thumbnail_workers_spin.valueChanged.connect(self._thumbnail_settings_changed)
+            self.display_size_spin.valueChanged.connect(
+                self._settings_display_size_changed
+            )
             self.thumbnail_tonemap_combo.currentIndexChanged.connect(
                 self._thumbnail_settings_changed
             )
@@ -652,6 +877,11 @@ if QtCore is not None:
                 int(self._settings.get("thumbnail_workers", config.DEFAULT_THUMBNAIL_WORKERS))
             )
             self.thumbnail_workers_spin.blockSignals(False)
+            self.display_size_spin.blockSignals(True)
+            self.display_size_spin.setValue(
+                int(self._settings.get("display_icon_size", 256))
+            )
+            self.display_size_spin.blockSignals(False)
             self.thumbnail_tonemap_combo.blockSignals(True)
             self.thumbnail_tonemap_combo.setCurrentIndex(
                 1 if self._settings.get("thumbnail_tonemap") == "aces" else 0
@@ -731,6 +961,21 @@ if QtCore is not None:
                 bool(self._settings.get("lowres_overwrite_existing", False))
             )
             self.lowres_overwrite.blockSignals(False)
+            self.import_destination_edit.setText(
+                self._settings.get("import_destination", "")
+            )
+            self.import_lowres_format_combo.setCurrentIndex(
+                max(
+                    0,
+                    self.import_lowres_format_combo.findData(
+                        self._settings.get("prepare_lowres_format", "both")
+                    ),
+                )
+            )
+            self.import_generate_thumbnails.setChecked(
+                bool(self._settings.get("prepare_generate_thumbnails", True))
+            )
+            self._import_options_changed()
             self._apply_icon_size()
             self.set_location_ui_mode(
                 self._settings.get("location_ui_mode", "sidebar"), save=False
@@ -792,9 +1037,20 @@ if QtCore is not None:
 
         def _display_size_changed(self, value):
             self._settings["display_icon_size"] = int(value)
+            self.display_size_spin.blockSignals(True)
+            self.display_size_spin.setValue(int(value))
+            self.display_size_spin.blockSignals(False)
             self._apply_icon_size()
             if not self.icon_size_slider.isSliderDown():
                 self._save()
+
+        def _settings_display_size_changed(self, value):
+            self.icon_size_slider.blockSignals(True)
+            self.icon_size_slider.setValue(int(value))
+            self.icon_size_slider.blockSignals(False)
+            self._settings["display_icon_size"] = int(value)
+            self._apply_icon_size()
+            self._save()
 
         def _display_icon(self, path):
             """Scale the cached PNG to the current icon size.
@@ -838,6 +1094,302 @@ if QtCore is not None:
                 self._settings = config.save_config(self._settings)
             except OSError as error:
                 self.status.setText("Could not save settings: {}".format(error))
+
+        def _open_import_picker(self):
+            self.tabs.setCurrentWidget(self.import_tab)
+            self._choose_import_source()
+
+        def _open_import_for_folder(self, folder, preset=None):
+            path = os.path.abspath(os.path.expanduser(os.fspath(folder)))
+            self.tabs.setCurrentWidget(self.import_tab)
+            self.import_source_edit.setText(path)
+            self._analyze_import_source(path)
+            if preset == "rat":
+                self.import_generate_rat.setChecked(True)
+            elif preset == "thumbnails":
+                self.import_generate_rat.setChecked(False)
+                for box in self.import_rung_boxes.values():
+                    box.setChecked(False)
+                self.import_generate_thumbnails.setChecked(True)
+            self._import_options_changed()
+
+        def _choose_import_source(self):
+            start = self.import_source_edit.text().strip() or self._folder
+            if start == ALL_HDRI or not os.path.isdir(start):
+                start = str(Path.home())
+            selected = QtWidgets.QFileDialog.getExistingDirectory(
+                self, "Choose HDRI source folder", start
+            )
+            if selected:
+                selected = os.path.abspath(selected)
+                self.import_source_edit.setText(selected)
+                self._analyze_import_source(selected)
+
+        def _choose_import_destination(self):
+            start = self.import_destination_edit.text().strip()
+            if not os.path.isdir(start):
+                start = str(Path.home())
+            selected = QtWidgets.QFileDialog.getExistingDirectory(
+                self, "Choose library destination", start
+            )
+            if selected:
+                self.import_destination_edit.setText(os.path.abspath(selected))
+
+        def _analysis_text(self, result):
+            format_text = ", ".join(
+                "{} {}".format(count, extension)
+                for extension in config.DEFAULT_EXTENSIONS
+                for count in [result.format_counts.get(extension, 0)]
+                if count
+            ) or "no supported formats"
+            bucket_order = ("16K", "8K", "4K", "2K", "1K", "<1K", "unknown")
+            bucket_text = ", ".join(
+                "{} {}".format(result.resolution_counts.get(label, 0), label)
+                for label in bucket_order
+                if result.resolution_counts.get(label, 0)
+            ) or "unknown"
+            structure = []
+            if result.has_rat:
+                structure.append("RAT conversions present")
+            if result.has_rung_folders:
+                structure.append("rung folders")
+            if result.has_suffix_variants:
+                structure.append("suffix variants")
+            if result.has_legacy_rat_names:
+                structure.append("legacy RAT names")
+            structure_text = ", ".join(structure) or "no generated structure detected"
+            return (
+                "{} logical HDRI{} · {} file{} · {}\n"
+                "Formats: {}\nResolutions: {}\nStructure: {}\n"
+                "Coverage: {}% RAT · {}% low-res · {}% thumbnails\n{}"
+            ).format(
+                result.image_count,
+                "" if result.image_count == 1 else "s",
+                result.file_count,
+                "" if result.file_count == 1 else "s",
+                _format_bytes(result.total_bytes),
+                format_text,
+                bucket_text,
+                structure_text,
+                result.rat_coverage,
+                result.lowres_coverage,
+                result.thumbnail_coverage,
+                " ".join(result.notes),
+            )
+
+        def _analyze_import_source(self, folder):
+            path = os.path.abspath(os.path.expanduser(str(folder).strip())) if str(folder).strip() else ""
+            if not path or not os.path.isdir(path):
+                self._import_analysis = None
+                self.import_analysis_label.setText(
+                    "Choose a readable folder for an instant, read-only analysis."
+                )
+                self._import_options_changed()
+                return
+            try:
+                result = analyze.analyze_folder(
+                    path,
+                    thumbnail_size=int(self._settings.get("thumbnail_size", 256)),
+                    thumbnail_tonemap=self._settings.get(
+                        "thumbnail_tonemap", thumbs.DEFAULT_TONEMAP
+                    ),
+                    rat_subfolder_name=self._settings.get(
+                        "rat_subfolder_name", "rat"
+                    ),
+                )
+            except Exception as error:
+                self._import_analysis = None
+                self.import_analysis_label.setText(
+                    "Could not analyze this folder: {}".format(error)
+                )
+                self._import_options_changed()
+                return
+            self._import_analysis = result
+            self.import_source_edit.setText(result.root)
+            self.import_analysis_label.setText(self._analysis_text(result))
+            useful = set(
+                prepare.sensible_rungs(result.original_paths, result.dimensions)
+            )
+            for width, box in self.import_rung_boxes.items():
+                box.blockSignals(True)
+                box.setChecked(width in useful)
+                box.blockSignals(False)
+            self.status.setText(
+                "Analysis complete: {} logical HDRI{} found.".format(
+                    result.image_count, "" if result.image_count == 1 else "s"
+                )
+            )
+            self._import_options_changed()
+
+        def _selected_import_rungs(self):
+            return tuple(
+                width
+                for width in prepare.PREPARE_RUNGS
+                if self.import_rung_boxes[width].isChecked()
+            )
+
+        def _build_import_plan(self):
+            result = self._import_analysis
+            if result is None or not result.original_paths:
+                raise ValueError("No supported source images were found")
+            widths = {
+                path: (
+                    result.dimensions[path][0]
+                    if result.dimensions.get(path) is not None
+                    else None
+                )
+                for path in result.original_paths
+            }
+            destination = None
+            if self.import_copy_radio.isChecked():
+                destination = self.import_destination_edit.text().strip()
+                if not destination:
+                    raise ValueError("Choose a separate library destination")
+            return prepare.build_pipeline_plan(
+                result.root,
+                result.original_paths,
+                convert_to_rat=self.import_generate_rat.isChecked(),
+                rungs=self._selected_import_rungs(),
+                widths=widths,
+                lowres_format=self.import_lowres_format_combo.currentData() or "both",
+                copy_destination=destination,
+            )
+
+        def _import_options_changed(self, _value=None):
+            copying = self.import_copy_radio.isChecked()
+            self.import_destination_edit.setEnabled(copying)
+            self.import_destination_button.setEnabled(copying)
+            lowres_format = self.import_lowres_format_combo.currentData() or "both"
+            consequences = {
+                "native": "Each rung keeps its source format.",
+                "rat": "Each rung is saved only as a mipmapped .rat.",
+                "both": "Each rung keeps its source format and adds a mipmapped .rat.",
+            }
+            self.import_lowres_help.setText(consequences[lowres_format])
+            try:
+                plan = self._build_import_plan()
+            except ValueError as error:
+                self._import_plan = None
+                self.import_summary.setText(str(error))
+                self.import_run_button.setEnabled(False)
+                return
+            self._import_plan = plan
+            parts = []
+            count = len(plan.sources)
+            if plan.copy_sources:
+                parts.append(
+                    "Copy {} image{} ({}) to {}".format(
+                        len(plan.copy_sources),
+                        "" if len(plan.copy_sources) == 1 else "s",
+                        _format_bytes(self._import_analysis.original_bytes),
+                        plan.root,
+                    )
+                )
+            else:
+                parts.append(
+                    "Organize {} image{} in place".format(
+                        count, "" if count == 1 else "s"
+                    )
+                )
+            if plan.convert_originals:
+                parts.append("convert {} → .rat".format(count))
+            if plan.rungs:
+                parts.append(
+                    "generate {} ({})".format(
+                        " + ".join(resize.rung_label(width).upper() for width in plan.rungs),
+                        {"native": "native", "rat": ".rat", "both": "native + .rat"}[
+                            plan.lowres_format
+                        ],
+                    )
+                )
+            if self.import_generate_thumbnails.isChecked():
+                thumbnail_candidates = list(plan.sources)
+                thumbnail_candidates.extend(
+                    target for stage in plan.resize_stages for target in stage.targets
+                )
+                if plan.convert_originals:
+                    allocated = convert.allocate_rat_targets(
+                        convert.rat_collision_source_union(plan.sources),
+                        "subfolder",
+                        self._settings.get("rat_subfolder_name", "rat"),
+                    )
+                    thumbnail_candidates.extend(
+                        str(allocated[source]) for source in plan.sources
+                    )
+                pending_thumbnails = sum(
+                    1
+                    for path in dict.fromkeys(thumbnail_candidates)
+                    if not thumbs.cached_thumbnail(
+                        path,
+                        size=int(self._settings.get("thumbnail_size", 256)),
+                        tonemap=self._settings.get(
+                            "thumbnail_tonemap", thumbs.DEFAULT_TONEMAP
+                        ),
+                    )
+                )
+                parts.append(
+                    "generate {} thumbnail{}".format(
+                        pending_thumbnails,
+                        "" if pending_thumbnails == 1 else "s",
+                    )
+                )
+            has_work = bool(
+                plan.copy_sources
+                or plan.convert_originals
+                or plan.rungs
+                or self.import_generate_thumbnails.isChecked()
+            )
+            self.import_summary.setText("; ".join(parts) + ".")
+            self.import_run_button.setEnabled(has_work and self._thread is None)
+
+        def _start_import(self):
+            if self._thread is not None:
+                return
+            try:
+                plan = self._build_import_plan()
+            except ValueError as error:
+                self.status.setText(str(error))
+                return
+            self._settings["rat_output_mode"] = "subfolder"
+            self._settings["lowres_output_mode"] = "subfolder"
+            self._settings["prepare_lowres_format"] = plan.lowres_format
+            self._settings["prepare_generate_thumbnails"] = (
+                self.import_generate_thumbnails.isChecked()
+            )
+            if plan.copy_sources:
+                self._settings["import_destination"] = plan.root
+            self._save()
+
+            thread = QtCore.QThread()
+            worker = PrepareWorker(plan, self._settings)
+            worker.moveToThread(thread)
+            thread.started.connect(worker.run)
+            worker.problem.connect(self._prepare_problem)
+            worker.progress.connect(self._job_progress)
+            worker.finished.connect(self._prepare_finished)
+            worker.finished.connect(thread.quit)
+            worker.finished.connect(worker.deleteLater)
+            thread.finished.connect(thread.deleteLater)
+            thread.finished.connect(lambda thread=thread: self._thread_finished(thread))
+            _ACTIVE_THREADS.add(thread)
+            self._thread = thread
+            self._worker = worker
+            self._job_kind = "prepare"
+            self._generation_errors = 0
+            self._import_plan = plan
+            self._prepare_context = {
+                "import": True,
+                "plan": plan,
+                "target": plan.root,
+            }
+            self._begin_job_progress("Importing", max(1, plan.total))
+            self._set_job_controls(True)
+            self.status.setText(
+                "Importing {} image{} in one cancellable job…".format(
+                    len(plan.sources), "" if len(plan.sources) == 1 else "s"
+                )
+            )
+            thread.start()
 
         def _root_entries(self):
             return self._settings.get("roots", [])
@@ -1090,6 +1642,15 @@ if QtCore is not None:
 
             menu = QtWidgets.QMenu(self.roots_list)
             menu.setToolTipsVisible(True)
+            reimport_action = QAction("Re-import / prepare this folder…", menu)
+            reimport_action.setEnabled(self._thread is None)
+            reimport_action.triggered.connect(
+                lambda _checked=False, root_path=root["path"]: self._open_import_for_folder(
+                    root_path
+                )
+            )
+            menu.addAction(reimport_action)
+            menu.addSeparator()
             convert_label = "Convert to .rat"
             if classification.state == "only-rat":
                 convert_label += " (all matching files are already .rat)"
@@ -1165,8 +1726,8 @@ if QtCore is not None:
             )
             prepare_action.setEnabled(available)
             prepare_action.triggered.connect(
-                lambda _checked=False, root_path=root["path"], values=paths, known_widths=widths, useful=rungs: self._show_prepare_dialog(
-                    root_path, values, known_widths, useful
+                lambda _checked=False, root_path=root["path"]: self._open_import_for_folder(
+                    root_path
                 )
             )
             menu.addAction(prepare_action)
@@ -1909,6 +2470,11 @@ if QtCore is not None:
             self._rebuild_locations()
             self.status.setText("Folder list refreshed.")
 
+        def _update_browse_empty(self):
+            empty = not bool(self._root_entries())
+            self.browse_empty.setVisible(empty)
+            self.splitter.setVisible(not empty)
+
         def _all_hdri_paths(self):
             found = set()
             for root in self._root_entries():
@@ -1924,12 +2490,13 @@ if QtCore is not None:
 
         def _populate_grid(self):
             self.grid.clear()
+            self._update_browse_empty()
             if self._folder == ALL_HDRI:
                 self._all_files = self._all_hdri_paths()
             elif not self._folder or not os.path.isdir(self._folder):
                 self._all_files = []
                 if not self._root_entries():
-                    self.status.setText("Add an HDRI root in Settings to begin.")
+                    self.status.setText("Add your first HDRI folder in Import to begin.")
                 return
             else:
                 root = self._root_for_folder()
@@ -2046,6 +2613,10 @@ if QtCore is not None:
                 clipboard.setText(path)
             self.status.setText("Copied {}".format(path))
 
+        def _open_file_location(self, path):
+            folder = path if os.path.isdir(path) else os.path.dirname(path)
+            QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(folder))
+
         def _assign_path(self, path):
             result = assign.assign_texture(path)
             # Always echo the concrete file so resolution picks are never silent.
@@ -2058,12 +2629,6 @@ if QtCore is not None:
             if clicked is not None and not clicked.isSelected():
                 self.grid.clearSelection()
                 clicked.setSelected(True)
-            selected = []
-            for entry in self.grid.selectedItems():
-                group_paths = entry.data(GROUP_ROLE)
-                for value in group_paths or ([entry.data(USER_ROLE)] if entry.data(USER_ROLE) else []):
-                    if value not in selected:
-                        selected.append(value)
             menu = QtWidgets.QMenu(self.grid)
             if clicked is not None:
                 clicked_paths = clicked.data(GROUP_ROLE) or (
@@ -2106,43 +2671,31 @@ if QtCore is not None:
                         )
                         copy_menu.addAction(copy_action)
                 elif entries:
+                    assign_action = QAction("Assign", menu)
+                    assign_action.triggered.connect(
+                        lambda _checked=False, value=entries[0][1]: self._assign_path(value)
+                    )
+                    menu.addAction(assign_action)
                     copy_action = QAction("Copy Path", menu)
                     copy_action.triggered.connect(
                         lambda _checked=False, value=entries[0][1]: self._copy_path(value)
                     )
                     menu.addAction(copy_action)
+                if entries:
+                    open_action = QAction("Open File Location", menu)
+                    open_action.triggered.connect(
+                        lambda _checked=False, value=entries[0][1]: self._open_file_location(value)
+                    )
+                    menu.addAction(open_action)
                 menu.addSeparator()
-            action = QAction("Convert to .rat", menu)
-            action.setEnabled(bool(selected) and self._thread is None)
-            action.triggered.connect(
-                lambda _checked=False, paths=selected: self._start_rat_conversion(
-                    paths, "selected texture"
+            root = self._root_for_folder()
+            reimport = QAction("Re-import / prepare this folder…", menu)
+            reimport.setEnabled(root is not None and self._thread is None)
+            if root is not None:
+                reimport.triggered.connect(
+                    lambda _checked=False, folder=root["path"]: self._open_import_for_folder(folder)
                 )
-            )
-            menu.addAction(action)
-            thumb_selected = QAction(
-                "Generate Thumbnails ({} selected)".format(len(selected)), menu
-            )
-            thumb_selected.setEnabled(bool(selected) and self._thread is None)
-            thumb_selected.triggered.connect(
-                lambda _checked=False, paths=selected: self._start_thumbnail_generation(
-                    paths, "selected thumbnail"
-                )
-            )
-            menu.addAction(thumb_selected)
-            all_files = list(self._all_files)
-            thumb_all = QAction(
-                "Generate Thumbnails (all {} in folder)".format(len(all_files)), menu
-            )
-            thumb_all.setEnabled(bool(all_files) and self._thread is None)
-            thumb_all.triggered.connect(
-                lambda _checked=False, paths=all_files: self._start_thumbnail_generation(
-                    paths, "thumbnail"
-                )
-            )
-            menu.addAction(thumb_all)
-            lowres_menu = menu.addMenu("Create Low-Res Versions")
-            self._populate_lowres_menu(lowres_menu, selected, "selected texture")
+            menu.addAction(reimport)
             menu.exec(self.grid.viewport().mapToGlobal(position))
 
         def _folder_scope_paths(self):
@@ -2464,6 +3017,10 @@ if QtCore is not None:
             self.convert_folder_button.setEnabled(not running)
             self.lowres_folder_button.setEnabled(not running)
             self.cancel_button.setEnabled(running)
+            if running:
+                self.import_run_button.setEnabled(False)
+            else:
+                self._import_options_changed()
 
         def _cancel_job(self):
             if self._worker is not None:
@@ -2473,10 +3030,10 @@ if QtCore is not None:
                     "thumbnails": "thumbnail",
                     "rat": "RAT",
                     "lowres": "low-res",
-                    "prepare": "library-preparation",
+                    "prepare": "import/preparation",
                 }.get(self._job_kind, "texture")
                 self.status.setText(
-                    "Cancelling pending and active {} conversions…".format(job)
+                    "Cancelling pending and active {} operations…".format(job)
                 )
 
         def _begin_job_progress(self, label, total):
@@ -2621,6 +3178,66 @@ if QtCore is not None:
 
         def _prepare_finished(self, cancelled, summary):
             context = self._prepare_context or {}
+            if context.get("import"):
+                plan = context.get("plan")
+                if not cancelled and plan is not None:
+                    self._settings = prepare.finished_import_config(
+                        self._settings, plan
+                    )
+                    entry = self._root_by_path(plan.root)
+                    if summary.failed:
+                        present = {
+                            files.extension_for(path, config.DEFAULT_EXTENSIONS)
+                            for path in files.scan_files(
+                                plan.root,
+                                extensions=config.DEFAULT_EXTENSIONS,
+                                recursive=True,
+                            )
+                        }
+                        actual = [
+                            extension
+                            for extension in config.DEFAULT_EXTENSIONS
+                            if extension in present
+                        ]
+                        if actual and entry is not None:
+                            entry["extensions"] = actual
+                    self.group_resolutions.blockSignals(True)
+                    self.group_resolutions.setChecked(True)
+                    self.group_resolutions.blockSignals(False)
+                    self.include_subfolders.blockSignals(True)
+                    self.include_subfolders.setChecked(True)
+                    self.include_subfolders.blockSignals(False)
+                    self._folder = plan.root
+                    self._folder_root = plan.root
+                    self._save()
+                    self._rebuild_root_settings(
+                        self._root_entries().index(self._root_by_path(plan.root))
+                    )
+                    self._rebuild_locations()
+                    self.tabs.setCurrentWidget(self.browse_tab)
+
+                if cancelled:
+                    message = "Import cancelled ({}/{})".format(
+                        summary.completed, self.progress.maximum()
+                    )
+                else:
+                    message = (
+                        "Import complete: {} copied, {} converted, {} resized, "
+                        "{} thumbnails, {} skipped, {} failed"
+                    ).format(
+                        summary.copied,
+                        summary.converted,
+                        summary.resized,
+                        summary.thumbnails,
+                        summary.skipped,
+                        summary.failed,
+                    )
+                self.status.setText(message)
+                self._set_job_controls(False)
+                self._worker = None
+                self._job_kind = None
+                self._prepare_context = None
+                return
             added = []
             if context.get("add_roots"):
                 parent = self._root_by_path(context.get("parent_path", ""))
@@ -2677,6 +3294,7 @@ if QtCore is not None:
             _ACTIVE_THREADS.discard(thread)
             if self._thread is thread:
                 self._thread = None
+            self._import_options_changed()
 
         def closeEvent(self, event):
             self._save()

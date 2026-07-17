@@ -111,18 +111,16 @@ Expected: `OK HDRILibPanel`.
 1. Start (or restart) Houdini.
 2. Open a pane tab menu → **New Pane Tab Type → Misc → HDRI Library** (searchable
    as "HDRI Library").
-3. Go to the **Settings** tab → add one or more root folders of HDRIs/textures.
-   Optional per folder: display label, color, and which file formats are shown.
-4. Back in **Browse**: pick a folder, press **Generate thumbnails** (parallel;
-   progress + ETA in the bar at the bottom of the panel).
+3. Go to **Import**, choose or drop a folder, review the instant analysis, and
+   choose whether to organize in place or copy into a separate library location.
+4. Choose `.rat`, low-resolution rung, and thumbnail outputs, then run the single
+   cancellable job. Progress + ETA appear at the bottom; completion lands in Browse.
 5. Assign: in Solaris, select a dome light (or any light with a texture parm; OBJ
    `envlight` also works), then **double-click** a thumbnail.
 
-Library management lives in the Settings tab's folder right-click menu: convert to
-`.rat` (mipmapped, via `imaketx`), generate low-res versions (8K/4K/2K/1K into
-resolution-named subfolders), thumbnail generation, and **Prepare for Library…**
-(one job that converts, downscales, thumbnails, and auto-adds the generated
-subfolders to the folder list).
+Re-importing an existing root uses the same Import health view and incrementally
+skips current outputs. Settings manages root labels, colors, formats, ordering, and
+application preferences; its folder context menu links back to Import.
 
 ## 5. State and cache locations (per user)
 

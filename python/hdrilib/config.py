@@ -24,7 +24,7 @@ DEFAULT_EXTENSIONS = (
     ".tiff",
 )
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 DEFAULT_THUMBNAIL_WORKERS = min(8, os.cpu_count() or 1)
 _COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 
@@ -48,6 +48,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "prepare_auto_add_subfolders": True,
     "prepare_generate_thumbnails": True,
     "prepare_lowres_format": "both",
+    "import_destination": "",
     "include_subfolders": False,
     "last_folder": "",
     "search_text": "",
@@ -240,10 +241,14 @@ def normalise_config(data: Mapping[str, Any] | None) -> dict[str, Any]:
     include_subfolders = data.get("include_subfolders")
     if isinstance(include_subfolders, bool):
         result["include_subfolders"] = include_subfolders
-    for key in ("last_folder", "search_text"):
+    for key in ("last_folder", "search_text", "import_destination"):
         value = data.get(key)
         if isinstance(value, str):
-            result[key] = value
+            result[key] = (
+                os.path.abspath(os.path.expanduser(value))
+                if key == "import_destination" and value.strip()
+                else value
+            )
     return result
 
 

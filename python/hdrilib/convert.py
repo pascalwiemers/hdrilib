@@ -103,7 +103,7 @@ def allocate_rat_targets(
 def rat_collision_sources(source: str | os.PathLike[str]) -> list[str]:
     """Return supported same-folder sources that share a replaced RAT stem."""
 
-    source_path = Path(source).expanduser().resolve()
+    source_path = Path(os.path.abspath(os.path.expanduser(os.fspath(source))))
     stem = os.path.normcase(source_path.stem)
     peers = [
         path
@@ -208,7 +208,7 @@ def write_rat(
 ) -> None:
     """Atomically write a RAT, preferring mipmapped imaketx over iconvert."""
 
-    source_path = Path(source).expanduser().resolve()
+    source_path = Path(os.path.abspath(os.path.expanduser(os.fspath(source))))
     target = Path(output).expanduser()
     backends = _rat_backends(executable)
     if not backends:
@@ -268,7 +268,7 @@ def convert_to_rat(
 
     if cancel_event is not None and cancel_event.is_set():
         raise RatConversionCancelled("RAT conversion cancelled")
-    source_path = Path(source).expanduser().resolve()
+    source_path = Path(os.path.abspath(os.path.expanduser(os.fspath(source))))
     if not source_path.is_file():
         raise RatConversionError("Source image does not exist: {}".format(source_path))
     if source_path.name.lower().endswith(".rat"):

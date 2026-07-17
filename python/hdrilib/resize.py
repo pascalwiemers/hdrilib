@@ -104,10 +104,12 @@ def build_resize_target(
         if source_root is not None or output_root is not None:
             if source_root is None or output_root is None:
                 raise ValueError("source_root and output_root must be provided together")
-            source_base = Path(source_root).expanduser().resolve()
-            output_base = Path(output_root).expanduser().resolve()
+            source_base = Path(os.path.abspath(os.path.expanduser(os.fspath(source_root))))
+            output_base = Path(os.path.abspath(os.path.expanduser(os.fspath(output_root))))
             try:
-                relative_parent = source_path.resolve().parent.relative_to(source_base)
+                relative_parent = Path(os.path.abspath(os.fspath(source_path))).parent.relative_to(
+                    source_base
+                )
             except ValueError as error:
                 raise ValueError("Resize source must be inside source_root") from error
             return output_base / label / relative_parent / (stem + suffix)
@@ -323,7 +325,7 @@ def resize_to_rung(
 ) -> ResizeResult:
     """Create native, mipmapped RAT, or both low-res output formats."""
 
-    source_path = Path(source).expanduser().resolve()
+    source_path = Path(os.path.abspath(os.path.expanduser(os.fspath(source))))
     width = int(target_width)
     rung_label(width)
     source_width, _source_height = get_resolution(

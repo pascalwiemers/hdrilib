@@ -12,9 +12,11 @@ light. No dependencies beyond Houdini itself.
 - "All HDRIs" aggregate view across every included folder
 - Optional grouping of resolution variants (`_1k`/`_4k` suffixes, `4k/` subfolders)
   with a configurable double-click resolution and per-variant copy-path menu
-- Batch conversion to mipmapped `.rat` (via `imaketx`) and low-res generation
-  (16K/8K/4K/2K/1K rungs), alongside sources or into resolution subfolders
-- "Prepare for Library…" one-shot pipeline: convert, downscale, thumbnail, auto-add
+- Guided **Import** flow that instantly analyzes formats, resolution structure,
+  conversion/low-res/thumbnail coverage, and approximate disk size
+- One cancellable import job: optionally copy originals to a read-only-source
+  destination, convert to mipmapped `.rat`, build 8K/4K/2K/1K rungs, and thumbnail
+- Incremental re-import/health checks that skip identical copies and current outputs
 
 ## Install
 
@@ -31,14 +33,14 @@ steps, and troubleshooting.
 
 ## Use
 
-1. **Settings** → add one or more HDRI folders (subfolders can become their own
-   entries). Pick formats, labels, and colors per folder.
-2. **Browse** → choose a location, hit **Generate thumbnails**.
+1. **Import** → choose or drop an HDRI folder, review its analysis, then choose
+   in-place organization or a separate library destination and what to generate.
+2. Run the plan. The finished folder is configured and selected in **Browse**.
 3. Select a light (Solaris dome/rect or OBJ `envlight`) and double-click a thumbnail.
 
-Right-click menus hold the batch tools: convert to `.rat`, low-res versions,
-thumbnails for a selection, and copy path. Library-wide jobs live in the Settings
-folder list's right-click menu.
+Browse item menus focus on assigning a specific resolution, opening its location,
+copying its path, and jumping back to Import for maintenance. **Settings** manages
+folder labels, colors, formats, ordering, and application preferences.
 
 ## State
 

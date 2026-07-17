@@ -67,7 +67,10 @@ def iter_files(
                 path = Path(current) / name
                 try:
                     if path.is_file():
-                        yield str(path.resolve())
+                        # Preserve the path as it appears under the selected root.
+                        # Resolving file symlinks can move a valid import source
+                        # outside that root and breaks relative copy structure.
+                        yield os.path.abspath(os.fspath(path))
                 except OSError:
                     continue
         return
@@ -80,7 +83,7 @@ def iter_files(
                     and path.is_file()
                     and matches_extension(path.name, extensions)
                 ):
-                    yield str(path.resolve())
+                    yield os.path.abspath(os.fspath(path))
             except OSError:
                 continue
     except OSError:
@@ -108,11 +111,11 @@ def iter_folders(root: str | os.PathLike[str]) -> Iterator[str]:
     root_path = Path(root).expanduser()
     if not root_path.is_dir():
         return
-    yield str(root_path.resolve())
+    yield os.path.abspath(os.fspath(root_path))
     for current, directories, _files in os.walk(root_path):
         directories[:] = sorted(
             (directory for directory in directories if _wanted_directory(directory)),
             key=str.lower,
         )
         for directory in directories:
-            yield str((Path(current) / directory).resolve())
+            yield os.path.abspath(os.fspath(Path(current) / directory))

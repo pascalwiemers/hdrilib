@@ -20,7 +20,7 @@ PYTHON_ROOT = REPO_ROOT / "python"
 if str(PYTHON_ROOT) not in sys.path:
     sys.path.insert(0, str(PYTHON_ROOT))
 
-from hdrilib import config, convert, files, prepare, resize, resolution, thumbs, variants  # noqa: E402
+from hdrilib import analyze, config, convert, files, prepare, resize, resolution, thumbs, variants  # noqa: E402
 from hdrilib.houdini import executable as houdini_executable  # noqa: E402
 import hdrilib.panel as panel  # noqa: E402
 
@@ -217,6 +217,7 @@ def main(argv=None) -> int:
         assert migrated["lowres_overwrite_existing"] is False
         assert migrated["prepare_lowres_format"] == "both"
         assert migrated["prepare_generate_thumbnails"] is True
+        assert migrated["import_destination"] == ""
 
         # Version 2 stored richer root objects but still kept both format sets
         # globally. The master enabled set, not its quick-filter subset, seeds roots.
@@ -276,6 +277,7 @@ def main(argv=None) -> int:
                 "lowres_overwrite_existing": "yes",
                 "prepare_generate_thumbnails": "yes",
                 "prepare_lowres_format": "invalid",
+                "import_destination": 42,
                 "include_subfolders": "yes",
                 "unknown_key": "discard me",
             }
@@ -301,6 +303,7 @@ def main(argv=None) -> int:
         assert strict["lowres_overwrite_existing"] is False
         assert strict["prepare_generate_thumbnails"] is True
         assert strict["prepare_lowres_format"] == "both"
+        assert strict["import_destination"] == ""
         assert strict["include_subfolders"] is False
         assert "unknown_key" not in strict
         assert "enabled_extensions" not in strict
@@ -345,6 +348,7 @@ def main(argv=None) -> int:
                 "prepare_auto_add_subfolders": False,
                 "prepare_generate_thumbnails": False,
                 "prepare_lowres_format": "rat",
+                "import_destination": str(work / "library-destination"),
                 "include_subfolders": True,
                 "last_folder": str(source),
                 "search_text": "church",
@@ -366,6 +370,7 @@ def main(argv=None) -> int:
         assert loaded["prepare_auto_add_subfolders"] is False
         assert loaded["prepare_generate_thumbnails"] is False
         assert loaded["prepare_lowres_format"] == "rat"
+        assert loaded["import_destination"] == str(work / "library-destination")
 
         scans = [
             files.scan_files(
@@ -375,7 +380,7 @@ def main(argv=None) -> int:
         ]
         assert [Path(path).suffix for path in scans[0]] == [".rat"]
         assert {Path(path).suffix for path in scans[1]} == {".rat", ".hdr"}
-        print("CONFIG ok: v1/v2 migration, strict v8 normalization, round trip")
+        print("CONFIG ok: v1/v2 migration, strict v9 normalization, round trip")
 
         groups = variants.build_groups(
             [
@@ -496,6 +501,51 @@ def main(argv=None) -> int:
         ]
         print("VARIANTS ok: originals, suffix/subfolder rungs, RAT forms, picks")
         print("PER-ROOT SCAN ok: RAT-only root differs from all-formats root")
+
+        analysis_root = work / "analysis-root"
+        (analysis_root / "rat").mkdir(parents=True)
+        (analysis_root / "4k").mkdir()
+        analysis_paths = [
+            analysis_root / "studio.exr",
+            analysis_root / "rat" / "studio.rat",
+            analysis_root / "rat" / "studio.exr.rat",
+            analysis_root / "4k" / "studio.rat",
+            analysis_root / "sunset_8k.hdr",
+            analysis_root / "sunset_4k.hdr",
+        ]
+        for index, path in enumerate(analysis_paths, 1):
+            path.write_bytes(("fixture-{}".format(index)).encode("ascii"))
+        dimensions = {
+            str(analysis_paths[0]): (12000, 6000),
+            str(analysis_paths[3]): (4096, 2048),
+            str(analysis_paths[4]): (8192, 4096),
+            str(analysis_paths[5]): (4096, 2048),
+        }
+        analyzed = analyze.analyze_paths(
+            analysis_root,
+            analysis_paths,
+            dimensions=dimensions,
+            thumbnail_cached=lambda path: path.endswith("studio.exr"),
+        )
+        assert analyzed.image_count == 2
+        assert analyzed.file_count == 6
+        assert analyzed.format_counts == {".exr": 1, ".rat": 3, ".hdr": 2}
+        assert analyzed.resolution_counts == {"8K": 2, "unknown": 2, "4K": 2}
+        assert analyzed.rat_coverage == 50
+        assert analyzed.lowres_coverage == 100
+        assert analyzed.thumbnail_coverage == 50
+        assert analyzed.has_rung_folders and analyzed.has_suffix_variants
+        assert analyzed.has_legacy_rat_names
+        assert analyzed.original_paths == (
+            str(analysis_root / "studio.exr"),
+            str(analysis_root / "sunset_8k.hdr"),
+        )
+        scanned_analysis = analyze.analyze_folder(analysis_root)
+        assert scanned_analysis.file_count == 6
+        assert scanned_analysis.image_count == 2
+        assert scanned_analysis.has_rung_folders
+        assert scanned_analysis.total_bytes == sum(path.stat().st_size for path in analysis_paths)
+        print("ANALYZE ok: formats/buckets, structure, coverage, size, source picks")
 
         target_source = work / "targets" / "sunset.exr"
         expected_alongside = target_source.parent / "sunset.rat"
@@ -821,6 +871,84 @@ def main(argv=None) -> int:
         )
         assert classification.state == "empty"
 
+        copy_source_root = work / "copy-source"
+        copy_source_file = copy_source_root / "set-a" / "dome.hdr"
+        copy_source_file.parent.mkdir(parents=True)
+        copy_source_file.write_bytes(b"read-only original pixels")
+        source_before = copy_source_file.stat()
+        source_bytes = copy_source_file.read_bytes()
+        copy_destination = work / "copy-destination"
+        copy_plan = prepare.build_pipeline_plan(
+            copy_source_root,
+            [copy_source_file],
+            copy_destination=copy_destination,
+        )
+        copied_target = copy_destination / "set-a" / "dome.hdr"
+        assert copy_plan.copy_sources == (str(copy_source_file),)
+        assert copy_plan.copy_targets == (str(copied_target),)
+        assert copy_plan.sources == (str(copied_target),)
+        copy_progress = []
+        copy_summary, copy_cancelled = prepare.run_pipeline(
+            copy_plan,
+            workers=2,
+            on_progress=lambda current, total: copy_progress.append((current, total)),
+        )
+        assert not copy_cancelled
+        assert copy_summary.copied == 1 and copy_summary.skipped == 0
+        assert copied_target.read_bytes() == source_bytes
+        assert copied_target.stat().st_mtime_ns == source_before.st_mtime_ns
+        source_after = copy_source_file.stat()
+        assert copy_source_file.read_bytes() == source_bytes
+        assert source_after.st_mtime_ns == source_before.st_mtime_ns
+        assert source_after.st_mode == source_before.st_mode
+        assert copy_progress[-1] == (1, 1)
+
+        skipped_copy_summary, skipped_copy_cancelled = prepare.run_pipeline(copy_plan)
+        assert not skipped_copy_cancelled
+        assert skipped_copy_summary.copied == 0
+        assert skipped_copy_summary.skipped == 1
+        copy_only_landed = prepare.finished_import_config(
+            config.DEFAULT_CONFIG, copy_plan
+        )
+        assert copy_only_landed["roots"][0]["extensions"] == [".hdr"]
+
+        cancel_copy_source = copy_source_root / "cancel.hdr"
+        cancel_copy_source.write_bytes(b"cancel me")
+        cancel_copy_target = copy_destination / "cancel.hdr"
+        copy_cancel_event = threading.Event()
+        copy_cancel_event.set()
+        cancel_copy_result = prepare.copy_originals_parallel(
+            [cancel_copy_source],
+            [cancel_copy_target],
+            cancel_event=copy_cancel_event,
+        )
+        assert cancel_copy_result == (0, 1, True)
+        assert not cancel_copy_target.exists()
+
+        landing_plan = prepare.build_pipeline_plan(
+            copy_source_root,
+            [copy_source_file],
+            convert_to_rat=True,
+            rungs=(4096,),
+            widths={str(copy_source_file): 9000},
+            lowres_format="rat",
+            copy_destination=copy_destination,
+        )
+        landed = prepare.finished_import_config(config.DEFAULT_CONFIG, landing_plan)
+        assert landed["group_resolutions"] is True
+        assert landed["include_subfolders"] is True
+        assert landed["last_folder"] == str(copy_destination)
+        assert landed["roots"] == [
+            {
+                "path": str(copy_destination),
+                "label": "copy-destination",
+                "color": "",
+                "extensions": [".rat"],
+                "include_in_all": True,
+            }
+        ]
+        print("COPY/LAND ok: preserve tree, identical skip, read-only source, cancellation, grouped root")
+
         original_parallel_rat = convert.convert_to_rat_parallel
         original_parallel_resize = resize.resize_to_rung_parallel
         pipeline_calls = []
@@ -1118,8 +1246,8 @@ def main(argv=None) -> int:
             "; ".join("{}: {}".format(extension, error) for extension, error in failures)
         )
         print(
-            "SMOKE PASS: config migration, filtered scanning, low-res logic/resize, "
-            "parallel thumbnails, imaketx RAT write, RAT bridge"
+            "SMOKE PASS: config migration, guided analysis/copy/landing, filtered "
+            "scanning, low-res logic/resize, parallel thumbnails, imaketx RAT write, RAT bridge"
         )
     return 0
 
