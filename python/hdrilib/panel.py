@@ -454,6 +454,7 @@ if QtCore is not None:
             self.roots_list.setRootIsDecorated(False)
             self.roots_list.setAlternatingRowColors(True)
             self.roots_list.setItemDelegate(RootSettingsDelegate(self.roots_list))
+            self.roots_list.setSelectionMode(EXTENDED_SELECTION)
             self.roots_list.setContextMenuPolicy(CUSTOM_CONTEXT_MENU)
             roots_layout.addWidget(self.roots_list)
             root_buttons = QtWidgets.QHBoxLayout()
@@ -883,6 +884,46 @@ if QtCore is not None:
                 widths[os.path.abspath(path)] = value[0] if value is not None else None
             return paths, widths, prepare.sensible_rungs(paths, dimensions)
 
+        def _show_multi_root_menu(self, position, selected_roots):
+            paths = []
+            for root in selected_roots:
+                for path in prepare.scan_root(root):
+                    if path not in paths:
+                        paths.append(path)
+            available = bool(paths) and self._thread is None
+            description = "{} folders".format(len(selected_roots))
+
+            menu = QtWidgets.QMenu(self.roots_list)
+            convert_action = QAction(
+                "Convert to .rat ({} files)".format(len(paths)), menu
+            )
+            convert_action.setEnabled(available)
+            convert_action.triggered.connect(
+                lambda _checked=False, values=paths: self._start_rat_conversion(
+                    values, "selected folder file"
+                )
+            )
+            menu.addAction(convert_action)
+            thumbnail_action = QAction(
+                "Generate Thumbnails ({} files)".format(len(paths)), menu
+            )
+            thumbnail_action.setEnabled(available)
+            thumbnail_action.triggered.connect(
+                lambda _checked=False, values=paths: self._start_thumbnail_generation(
+                    values, "folder file"
+                )
+            )
+            menu.addAction(thumbnail_action)
+            lowres_menu = menu.addMenu("Generate Low-Res Versions")
+            self._populate_lowres_menu(lowres_menu, paths, description)
+            menu.addSeparator()
+            remove_action = QAction(
+                "Remove {} entries".format(len(selected_roots)), menu
+            )
+            remove_action.triggered.connect(lambda _checked=False: self._remove_root())
+            menu.addAction(remove_action)
+            menu.exec(self.roots_list.viewport().mapToGlobal(position))
+
         def _set_root_include_in_all(self, root_path, included):
             root = self._root_by_path(root_path)
             if root is None:
@@ -919,9 +960,16 @@ if QtCore is not None:
             item = self.roots_list.itemAt(position)
             if item is None:
                 return
+            if not item.isSelected():
+                self.roots_list.clearSelection()
+                item.setSelected(True)
             self.roots_list.setCurrentItem(item)
-            row = self.roots_list.indexOfTopLevelItem(item)
+            rows = self._selected_root_rows()
             roots = self._root_entries()
+            if len(rows) > 1:
+                self._show_multi_root_menu(position, [roots[row] for row in rows])
+                return
+            row = self.roots_list.indexOfTopLevelItem(item)
             if not 0 <= row < len(roots):
                 return
             root = roots[row]
@@ -1228,8 +1276,8 @@ if QtCore is not None:
                     (
                         entry.path
                         for entry in os.scandir(selected)
-                        if entry.is_dir(follow_symlinks=False)
-                        and files._wanted_directory(entry.name)
+                        # Follow symlinks: NAS libraries commonly link set folders.
+                        if entry.is_dir() and files._wanted_directory(entry.name)
                     ),
                     key=str.lower,
                 )
@@ -1287,24 +1335,43 @@ if QtCore is not None:
             selected = additions[0]
             if row is None:
                 row = 0
+            self.status.setText(
+                "Added {} folder entr{}.".format(
+                    len(additions), "y" if len(additions) == 1 else "ies"
+                )
+            )
             self._folder = selected
             self._folder_root = selected
             self._save()
             self._rebuild_root_settings(row)
             self._rebuild_locations()
 
-        def _remove_root(self):
-            item = self.roots_list.currentItem()
-            row = self.roots_list.indexOfTopLevelItem(item) if item is not None else -1
+        def _selected_root_rows(self):
             roots = self._root_entries()
-            if not 0 <= row < len(roots):
+            rows = {
+                self.roots_list.indexOfTopLevelItem(item)
+                for item in self.roots_list.selectedItems()
+            }
+            current = self.roots_list.currentItem()
+            if not rows and current is not None:
+                rows = {self.roots_list.indexOfTopLevelItem(current)}
+            return sorted(row for row in rows if 0 <= row < len(roots))
+
+        def _remove_root(self):
+            rows = self._selected_root_rows()
+            roots = self._root_entries()
+            if not rows:
                 return
-            removed = roots.pop(row)["path"]
-            if self._folder == removed or self._folder.startswith(removed + os.sep):
-                self._folder = roots[0]["path"] if roots else ""
-                self._folder_root = roots[0]["path"] if roots else ""
+            for row in reversed(rows):
+                removed = roots.pop(row)["path"]
+                if self._folder == removed or self._folder.startswith(removed + os.sep):
+                    self._folder = ""
+                    self._folder_root = ""
+            if not self._folder and roots:
+                self._folder = roots[0]["path"]
+                self._folder_root = roots[0]["path"]
             self._save()
-            self._rebuild_root_settings(min(row, len(roots) - 1))
+            self._rebuild_root_settings(min(rows[0], len(roots) - 1))
             self._rebuild_locations()
 
         def _move_root(self, offset):
