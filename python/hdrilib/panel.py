@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import os
 import threading
+import time
+from collections import deque
 from pathlib import Path
 
 from . import assign, config, convert, files, prepare, resize, resolution, thumbs
@@ -22,6 +24,19 @@ except (ImportError, RuntimeError) as error:
 
 
 _ACTIVE_THREADS = set()
+
+
+def _format_duration(seconds):
+    """Format an ETA compactly for the shared progress bar."""
+
+    seconds = max(0, int(round(seconds)))
+    if seconds < 60:
+        return "{}s".format(seconds)
+    minutes, seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return "{}m {}s".format(minutes, seconds)
+    hours, minutes = divmod(minutes, 60)
+    return "{}h {}m".format(hours, minutes)
 
 
 if QtCore is not None:
@@ -239,6 +254,10 @@ if QtCore is not None:
                     resize_overwrite=bool(
                         self._settings.get("lowres_overwrite_existing", False)
                     ),
+                    generate_thumbnails=bool(
+                        self._settings.get("prepare_generate_thumbnails", True)
+                    ),
+                    thumbnail_size=int(self._settings.get("thumbnail_size", 256)),
                     workers=int(
                         self._settings.get(
                             "thumbnail_workers", config.DEFAULT_THUMBNAIL_WORKERS
@@ -272,6 +291,10 @@ if QtCore is not None:
             self._generation_errors = 0
             self._conversion_skipped = 0
             self._prepare_context = None
+            self._progress_label = "Processing"
+            self._progress_last_time = 0.0
+            self._progress_last_count = 0
+            self._progress_samples = deque(maxlen=20)
             self._format_actions = {}
             self._root_format_buttons = {}
             self._updating_roots = False
@@ -791,6 +814,18 @@ if QtCore is not None:
             )
             menu.addAction(convert_action)
 
+            thumbnail_action = QAction(
+                self._filtered_action_text("Generate Thumbnails", classification),
+                menu,
+            )
+            thumbnail_action.setEnabled(available)
+            thumbnail_action.triggered.connect(
+                lambda _checked=False, values=paths: self._start_thumbnail_generation(
+                    values, "folder file"
+                )
+            )
+            menu.addAction(thumbnail_action)
+
             lowres_label = self._filtered_action_text(
                 "Generate Low-Res Versions", classification
             )
@@ -847,6 +882,7 @@ if QtCore is not None:
                     "Use Edit Formats… to include them."
                 )
                 convert_action.setToolTip(tooltip)
+                thumbnail_action.setToolTip(tooltip)
                 lowres_menu.menuAction().setToolTip(tooltip)
                 prepare_action.setToolTip(tooltip)
             menu.addSeparator()
@@ -883,6 +919,13 @@ if QtCore is not None:
                 bool(self._settings.get("prepare_auto_add_subfolders", True))
             )
             layout.addWidget(add_roots)
+            generate_thumbnails = QtWidgets.QCheckBox(
+                "Generate thumbnails when done"
+            )
+            generate_thumbnails.setChecked(
+                bool(self._settings.get("prepare_generate_thumbnails", True))
+            )
+            layout.addWidget(generate_thumbnails)
             buttons = QtWidgets.QDialogButtonBox(DIALOG_OK | DIALOG_CANCEL)
             buttons.accepted.connect(dialog.accept)
             buttons.rejected.connect(dialog.reject)
@@ -896,7 +939,12 @@ if QtCore is not None:
                 rungs=rungs,
                 widths=widths or None,
             )
-            self._start_root_prepare(plan, add_roots.isChecked(), title)
+            self._start_root_prepare(
+                plan,
+                add_roots.isChecked(),
+                generate_thumbnails.isChecked(),
+                title,
+            )
 
         def _show_prepare_dialog(self, root_path, paths, widths, useful_rungs):
             dialog = QtWidgets.QDialog(self)
@@ -927,6 +975,13 @@ if QtCore is not None:
                 bool(self._settings.get("prepare_auto_add_subfolders", True))
             )
             layout.addWidget(add_roots)
+            generate_thumbnails = QtWidgets.QCheckBox(
+                "Generate thumbnails when done"
+            )
+            generate_thumbnails.setChecked(
+                bool(self._settings.get("prepare_generate_thumbnails", True))
+            )
+            layout.addWidget(generate_thumbnails)
             buttons = QtWidgets.QDialogButtonBox(DIALOG_OK | DIALOG_CANCEL)
             buttons.accepted.connect(dialog.accept)
             buttons.rejected.connect(dialog.reject)
@@ -945,7 +1000,10 @@ if QtCore is not None:
                 widths=widths,
             )
             self._start_root_prepare(
-                plan, add_roots.isChecked(), "Prepare for Library"
+                plan,
+                add_roots.isChecked(),
+                generate_thumbnails.isChecked(),
+                "Prepare for Library",
             )
 
         def _root_format_changed(self, root_path, extension, checked):
@@ -1471,8 +1529,7 @@ if QtCore is not None:
             self._job_kind = "rat"
             self._generation_errors = 0
             self._conversion_skipped = 0
-            self.progress.setRange(0, len(paths))
-            self.progress.setValue(0)
+            self._begin_job_progress("Converting", len(paths))
             self._set_job_controls(True)
             workers = min(len(paths), worker._workers)
             self.status.setText(
@@ -1520,8 +1577,7 @@ if QtCore is not None:
             self._job_kind = "lowres"
             self._generation_errors = 0
             self._conversion_skipped = 0
-            self.progress.setRange(0, len(paths))
-            self.progress.setValue(0)
+            self._begin_job_progress("Creating low-res", len(paths))
             self._set_job_controls(True)
             workers = min(len(paths), worker._workers)
             self.status.setText(
@@ -1536,9 +1592,21 @@ if QtCore is not None:
             )
             thread.start()
 
-        def _start_root_prepare(self, plan, add_roots, description):
+        def _start_root_prepare(
+            self, plan, add_roots, generate_thumbnails, description
+        ):
+            changed = False
             if bool(self._settings.get("prepare_auto_add_subfolders", True)) != bool(add_roots):
                 self._settings["prepare_auto_add_subfolders"] = bool(add_roots)
+                changed = True
+            if bool(self._settings.get("prepare_generate_thumbnails", True)) != bool(
+                generate_thumbnails
+            ):
+                self._settings["prepare_generate_thumbnails"] = bool(
+                    generate_thumbnails
+                )
+                changed = True
+            if changed:
                 self._save()
             if self._thread is not None or not plan.total:
                 if not plan.total:
@@ -1596,8 +1664,7 @@ if QtCore is not None:
                 "generated": generated,
                 "description": description,
             }
-            self.progress.setRange(0, plan.total)
-            self.progress.setValue(0)
+            self._begin_job_progress("Preparing", plan.total)
             self._set_job_controls(True)
             self.status.setText(
                 "{}: running {} queued operation{}…".format(
@@ -1607,16 +1674,19 @@ if QtCore is not None:
             thread.start()
 
         def _start_generation(self):
+            self._start_thumbnail_generation(self._all_files, "thumbnail")
+
+        def _start_thumbnail_generation(self, paths, description):
             if self._thread is not None:
                 return
             size = int(self._settings.get("thumbnail_size", 256))
             pending = [
                 path
-                for path in self._all_files
+                for path in paths
                 if not thumbs.cached_thumbnail(path, size=size)
             ]
             if not pending:
-                self.status.setText("All thumbnails for this view are cached.")
+                self.status.setText("All thumbnails for this scope are cached.")
                 return
 
             thread = QtCore.QThread()
@@ -1640,13 +1710,13 @@ if QtCore is not None:
             self._worker = worker
             self._job_kind = "thumbnails"
             self._generation_errors = 0
-            self.progress.setRange(0, len(pending))
-            self.progress.setValue(0)
+            self._begin_job_progress("Generating thumbnails", len(pending))
             self._set_job_controls(True)
             workers = min(len(pending), worker._workers)
             self.status.setText(
-                "Generating {} thumbnail{} with {} worker{}…".format(
+                "Generating {} {}{} with {} worker{}…".format(
                     len(pending),
+                    description,
                     "" if len(pending) == 1 else "s",
                     workers,
                     "" if workers == 1 else "s",
@@ -1674,9 +1744,44 @@ if QtCore is not None:
                     "Cancelling pending and active {} conversions…".format(job)
                 )
 
+        def _begin_job_progress(self, label, total):
+            self._progress_label = label
+            self._progress_last_time = time.monotonic()
+            self._progress_last_count = 0
+            self._progress_samples.clear()
+            self.progress.setRange(0, total)
+            self.progress.setValue(0)
+            self.progress.setFormat(
+                "{} 0/{} (0%) — estimating…".format(label, total)
+            )
+
         def _job_progress(self, current, total):
+            now = time.monotonic()
+            delta_count = current - self._progress_last_count
+            if delta_count > 0:
+                elapsed = max(0.0, now - self._progress_last_time)
+                per_file = elapsed / float(delta_count)
+                for _index in range(delta_count):
+                    self._progress_samples.append(per_file)
+                self._progress_last_time = now
+                self._progress_last_count = current
             self.progress.setRange(0, total)
             self.progress.setValue(current)
+            percent = int(round((100.0 * current / total) if total else 0.0))
+            if current >= 3 and self._progress_samples and current < total:
+                average = sum(self._progress_samples) / len(self._progress_samples)
+                estimate = "about {} left".format(
+                    _format_duration(average * (total - current))
+                )
+            elif current >= total and total:
+                estimate = "done"
+            else:
+                estimate = "estimating…"
+            self.progress.setFormat(
+                "{} {}/{} ({}%) — {}".format(
+                    self._progress_label, current, total, percent, estimate
+                )
+            )
 
         def _thumbnail_ready(self, source, thumbnail):
             for index in range(self.grid.count()):
@@ -1806,10 +1911,11 @@ if QtCore is not None:
             else:
                 message = (
                     "Library preparation complete: {} converted, {} resized, "
-                    "{} skipped, {} failed"
+                    "{} thumbnails, {} skipped, {} failed"
                 ).format(
                     summary.converted,
                     summary.resized,
+                    summary.thumbnails,
                     summary.skipped,
                     summary.failed,
                 )

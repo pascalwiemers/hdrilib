@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Sequence
 
-from . import config, convert, files, resize
+from . import config, convert, files, resize, thumbs
 
 
 PREPARE_RUNGS = (8192, 4096, 2048, 1024)
@@ -55,6 +55,7 @@ class PipelineSummary:
     resized: int = 0
     skipped: int = 0
     failed: int = 0
+    thumbnails: int = 0
 
 
 @dataclass(frozen=True)
@@ -259,6 +260,58 @@ def folder_is_rat_only(path: str | os.PathLike[str]) -> bool:
     return found
 
 
+def final_thumbnail_paths(
+    plan: PipelinePlan,
+    *,
+    rat_mode: str = "alongside",
+    rat_subfolder_name: str = "rat",
+    resize_also_rat: bool = False,
+) -> list[str]:
+    """Return existing final pipeline inputs and outputs, once each.
+
+    This is intentionally pure planning/filesystem logic: callers can use it after
+    the conversion and resize stages without depending on either image backend.
+    """
+
+    candidates = list(plan.sources)
+    generated = [target for stage in plan.resize_stages for target in stage.targets]
+    candidates.extend(generated)
+    if plan.convert_originals:
+        candidates.extend(
+            str(convert.build_rat_target(source, rat_mode, rat_subfolder_name))
+            for source in plan.sources
+        )
+    if plan.convert_generated:
+        candidates.extend(
+            str(convert.build_rat_target(target, rat_mode, rat_subfolder_name))
+            for target in generated
+        )
+    elif resize_also_rat:
+        for stage in plan.resize_stages:
+            candidates.extend(
+                str(
+                    resize.build_resize_rat_target(
+                        source,
+                        stage.width,
+                        "subfolder",
+                        source_root=plan.root,
+                        output_root=plan.root,
+                    )
+                )
+                for source in stage.sources
+            )
+
+    result = []
+    seen = set()
+    for candidate in candidates:
+        absolute = _absolute_path(candidate)
+        key = _path_key(absolute)
+        if key not in seen and os.path.isfile(absolute):
+            seen.add(key)
+            result.append(absolute)
+    return result
+
+
 def run_pipeline(
     plan: PipelinePlan,
     *,
@@ -267,6 +320,8 @@ def run_pipeline(
     rat_overwrite: bool = False,
     resize_also_rat: bool = False,
     resize_overwrite: bool = False,
+    generate_thumbnails: bool = False,
+    thumbnail_size: int = 256,
     workers: int = 1,
     cancel_event: threading.Event | None = None,
     on_progress: Callable[[int, int], None] | None = None,
@@ -360,4 +415,28 @@ def run_pipeline(
                 on_error=problem,
                 on_progress=progressed,
             )
+
+    if generate_thumbnails and not event.is_set():
+        thumbnail_paths = final_thumbnail_paths(
+            plan,
+            rat_mode=rat_mode,
+            rat_subfolder_name=rat_subfolder_name,
+            resize_also_rat=resize_also_rat,
+        )
+        total += len(thumbnail_paths)
+
+        def thumbnail_ready(_source: str, _target: str) -> None:
+            summary.thumbnails += 1
+
+        if on_progress is not None:
+            on_progress(summary.completed, total)
+        thumbs.generate_thumbnails_parallel(
+            thumbnail_paths,
+            size=thumbnail_size,
+            workers=workers,
+            cancel_event=event,
+            on_result=thumbnail_ready,
+            on_error=problem,
+            on_progress=progressed,
+        )
     return summary, event.is_set()

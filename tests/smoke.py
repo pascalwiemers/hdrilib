@@ -72,6 +72,9 @@ def main(argv=None) -> int:
     source = Path(args.source).expanduser().resolve()
     assert source.is_dir(), "test texture folder is missing: {}".format(source)
     config.config_dir().mkdir(parents=True, exist_ok=True)
+    assert panel._format_duration(9) == "9s"
+    assert panel._format_duration(130) == "2m 10s"
+    assert panel._format_duration(7500) == "2h 5m"
 
     with tempfile.TemporaryDirectory(prefix="smoke-", dir=str(config.config_dir())) as work:
         work = Path(work)
@@ -149,6 +152,7 @@ def main(argv=None) -> int:
         assert migrated["lowres_output_mode"] == "alongside"
         assert migrated["lowres_also_rat"] is False
         assert migrated["lowres_overwrite_existing"] is False
+        assert migrated["prepare_generate_thumbnails"] is True
 
         # Version 2 stored richer root objects but still kept both format sets
         # globally. The master enabled set, not its quick-filter subset, seeds roots.
@@ -205,6 +209,7 @@ def main(argv=None) -> int:
                 "lowres_output_mode": "elsewhere",
                 "lowres_also_rat": "yes",
                 "lowres_overwrite_existing": "yes",
+                "prepare_generate_thumbnails": "yes",
                 "include_subfolders": "yes",
                 "unknown_key": "discard me",
             }
@@ -227,6 +232,7 @@ def main(argv=None) -> int:
         assert strict["lowres_output_mode"] == "alongside"
         assert strict["lowres_also_rat"] is False
         assert strict["lowres_overwrite_existing"] is False
+        assert strict["prepare_generate_thumbnails"] is True
         assert strict["include_subfolders"] is False
         assert "unknown_key" not in strict
         assert "enabled_extensions" not in strict
@@ -268,6 +274,8 @@ def main(argv=None) -> int:
                 "lowres_output_mode": "subfolder",
                 "lowres_also_rat": True,
                 "lowres_overwrite_existing": True,
+                "prepare_auto_add_subfolders": False,
+                "prepare_generate_thumbnails": False,
                 "include_subfolders": True,
                 "last_folder": str(source),
                 "search_text": "church",
@@ -286,6 +294,8 @@ def main(argv=None) -> int:
         assert loaded["lowres_output_mode"] == "subfolder"
         assert loaded["lowres_also_rat"] is True
         assert loaded["lowres_overwrite_existing"] is True
+        assert loaded["prepare_auto_add_subfolders"] is False
+        assert loaded["prepare_generate_thumbnails"] is False
 
         scans = [
             files.scan_files(
@@ -295,7 +305,7 @@ def main(argv=None) -> int:
         ]
         assert [Path(path).suffix for path in scans[0]] == [".rat"]
         assert {Path(path).suffix for path in scans[1]} == {".rat", ".hdr"}
-        print("CONFIG ok: v1/v2 migration, strict v5 normalization, round trip")
+        print("CONFIG ok: v1/v2 migration, strict v7 normalization, round trip")
         print("PER-ROOT SCAN ok: RAT-only root differs from all-formats root")
 
         target_source = work / "targets" / "sunset.exr"
@@ -396,6 +406,47 @@ def main(argv=None) -> int:
             [large, small], {str(large): (9000, 4500), str(small): None}
         ) == prepare.PREPARE_RUNGS
 
+        # The final thumbnail stage includes originals and every existing output.
+        # RAT inputs also prove that a native low-res RAT and its conversion target
+        # collapse to one path.
+        thumbnail_rat = prepare_root / "source.rat"
+        thumbnail_rat.touch()
+        thumbnail_plan = prepare.build_pipeline_plan(
+            prepare_root,
+            [thumbnail_rat],
+            convert_to_rat=True,
+            rungs=(4096,),
+            widths={str(thumbnail_rat): 9000},
+        )
+        thumbnail_lowres = Path(thumbnail_plan.resize_stages[0].targets[0])
+        thumbnail_lowres.parent.mkdir(parents=True, exist_ok=True)
+        thumbnail_lowres.touch()
+        thumbnail_paths = prepare.final_thumbnail_paths(thumbnail_plan)
+        assert thumbnail_paths == [str(thumbnail_rat), str(thumbnail_lowres)]
+
+        original_rat = convert.build_rat_target(large, "alongside", "rat")
+        original_rat.touch()
+        existing_lowres = Path(plan.resize_stages[0].targets[0])
+        existing_lowres.parent.mkdir(parents=True, exist_ok=True)
+        existing_lowres.touch()
+        generated_rat = convert.build_rat_target(existing_lowres, "alongside", "rat")
+        generated_rat.touch()
+        final_paths = prepare.final_thumbnail_paths(plan)
+        assert str(large) in final_paths and str(small) in final_paths
+        assert str(existing_lowres) in final_paths
+        assert str(original_rat) in final_paths and str(generated_rat) in final_paths
+        assert len(final_paths) == len(set(final_paths))
+        duplicate_plan = prepare.PipelinePlan(
+            str(prepare_root),
+            (str(large),),
+            False,
+            (
+                prepare.ResizeStage(4096, (str(large),), (str(large),)),
+            ),
+            False,
+        )
+        assert prepare.final_thumbnail_paths(duplicate_plan) == [str(large)]
+
         parent_root = {
             "path": str(prepare_root),
             "label": "Studio",
@@ -427,7 +478,7 @@ def main(argv=None) -> int:
             },
         ]
         generated_4k = prepare_root / "4k"
-        generated_4k.mkdir()
+        generated_4k.mkdir(exist_ok=True)
         (generated_4k / "old.exr").touch()
         scanned = prepare.scan_root(parent_root)
         assert str(large) in scanned and str(small) in scanned
