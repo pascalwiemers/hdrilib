@@ -36,6 +36,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "thumbnail_workers": DEFAULT_THUMBNAIL_WORKERS,
     "display_icon_size": 256,
     "view_mode": "grid",
+    "thumbnail_tonemap": "neutral",
     "rat_output_mode": "alongside",
     "rat_subfolder_name": "rat",
     "rat_overwrite_existing": False,
@@ -181,6 +182,10 @@ def normalise_config(data: Mapping[str, Any] | None) -> dict[str, Any]:
     view_mode = data.get("view_mode")
     if view_mode in ("grid", "list"):
         result["view_mode"] = view_mode
+
+    tonemap = data.get("thumbnail_tonemap")
+    if tonemap in ("neutral", "aces"):
+        result["thumbnail_tonemap"] = tonemap
 
     rat_output_mode = data.get("rat_output_mode")
     if rat_output_mode in ("alongside", "subfolder"):

@@ -334,6 +334,7 @@ def run_pipeline(
     resize_overwrite: bool = False,
     generate_thumbnails: bool = False,
     thumbnail_size: int = 256,
+    thumbnail_tonemap: str | None = None,
     workers: int = 1,
     cancel_event: threading.Event | None = None,
     on_progress: Callable[[int, int], None] | None = None,
@@ -421,6 +422,7 @@ def run_pipeline(
         thumbs.generate_thumbnails_parallel(
             thumbnail_paths,
             size=thumbnail_size,
+            tonemap=thumbnail_tonemap,
             workers=workers,
             cancel_event=event,
             on_result=thumbnail_ready,

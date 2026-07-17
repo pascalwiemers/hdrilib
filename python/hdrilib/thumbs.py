@@ -19,11 +19,15 @@ from .jobs import JobCancelled, run_parallel
 
 
 # Recipe changes intentionally invalidate old thumbnails.
-THUMBNAIL_RECIPE = "h22-aces-sdr-exposure-minus1-rat-bridge-v2"
+THUMBNAIL_RECIPE = "h22-thumb-v3"
 EXPOSURE_MULTIPLIER = "0.5"
 LINEAR_COLORSPACE = "Linear Rec.709 (sRGB)"
 DISPLAY = "sRGB - Display"
 VIEW = "ACES 1.0 - SDR Video"
+# "neutral" log-compresses highlights and keeps shadows open; "aces" applies
+# Houdini's filmic ACES SDR view, which is noticeably more contrasty.
+TONEMAPS = ("neutral", "aces")
+DEFAULT_TONEMAP = "neutral"
 
 
 class ThumbnailError(RuntimeError):
@@ -45,11 +49,24 @@ def thumbnail_tools(hfs: str | None = None) -> list[str]:
     return result
 
 
-def thumbnail_key(source: str | os.PathLike[str], size: int = 256) -> str:
+def normalise_tonemap(tonemap: str | None) -> str:
+    return tonemap if tonemap in TONEMAPS else DEFAULT_TONEMAP
+
+
+def thumbnail_key(
+    source: str | os.PathLike[str], size: int = 256, tonemap: str | None = None
+) -> str:
     path = Path(source).expanduser().resolve()
     stat = path.stat()
     identity = "\0".join(
-        (str(path), str(stat.st_mtime_ns), str(stat.st_size), str(int(size)), THUMBNAIL_RECIPE)
+        (
+            str(path),
+            str(stat.st_mtime_ns),
+            str(stat.st_size),
+            str(int(size)),
+            THUMBNAIL_RECIPE,
+            normalise_tonemap(tonemap),
+        )
     )
     return hashlib.sha1(identity.encode("utf-8")).hexdigest()
 
@@ -58,21 +75,42 @@ def thumbnail_path(
     source: str | os.PathLike[str],
     size: int = 256,
     cache_dir: str | os.PathLike[str] | None = None,
+    tonemap: str | None = None,
 ) -> Path:
     directory = Path(cache_dir).expanduser() if cache_dir else thumbs_dir()
-    return directory / (thumbnail_key(source, size=size) + ".png")
+    return directory / (thumbnail_key(source, size=size, tonemap=tonemap) + ".png")
 
 
 def cached_thumbnail(
     source: str | os.PathLike[str],
     size: int = 256,
     cache_dir: str | os.PathLike[str] | None = None,
+    tonemap: str | None = None,
 ) -> str | None:
     try:
-        result = thumbnail_path(source, size=size, cache_dir=cache_dir)
+        result = thumbnail_path(source, size=size, cache_dir=cache_dir, tonemap=tonemap)
     except OSError:
         return None
     return str(result) if result.is_file() and result.stat().st_size > 0 else None
+
+
+def clear_cache(cache_dir: str | os.PathLike[str] | None = None) -> tuple[int, int]:
+    """Delete every cached thumbnail PNG, returning ``(files, bytes)`` removed."""
+
+    directory = Path(cache_dir).expanduser() if cache_dir else thumbs_dir()
+    removed = 0
+    freed = 0
+    if not directory.is_dir():
+        return removed, freed
+    for entry in directory.glob("*.png"):
+        try:
+            size = entry.stat().st_size
+            entry.unlink()
+        except OSError:
+            continue
+        removed += 1
+        freed += size
+    return removed, freed
 
 
 def hoiiotool_command(
@@ -80,28 +118,41 @@ def hoiiotool_command(
     source: str | os.PathLike[str],
     output: str | os.PathLike[str],
     size: int = 256,
+    tonemap: str | None = None,
 ) -> list[str]:
-    """Build the empirically verified H22 thumbnail command.
+    """Build the thumbnail conversion command for the chosen tone mapping.
 
-    A one-stop reduction followed by Houdini's ACES SDR display transform keeps
-    typical HDR environments readable and rolls highlights off below hard white.
+    "neutral" log-compresses highlights and applies a display gamma without any
+    OCIO dependency. "aces" runs Houdini's filmic ACES SDR view via OCIO.
     """
 
-    return [
+    command = [
         executable,
         os.fspath(source),
         "--resize",
         "{}x0".format(int(size)),
         "--mulc",
         EXPOSURE_MULTIPLIER,
-        "--ociodisplay:from={}".format(LINEAR_COLORSPACE),
-        DISPLAY,
-        VIEW,
+    ]
+    if normalise_tonemap(tonemap) == "aces":
+        command += [
+            "--ociodisplay:from={}".format(LINEAR_COLORSPACE),
+            DISPLAY,
+            VIEW,
+        ]
+    else:
+        command += [
+            "--rangecompress",
+            "--powc",
+            "0.4545",
+        ]
+    command += [
         "-d",
         "uint8",
         "-o",
         os.fspath(output),
     ]
+    return command
 
 
 def hoiiotool_fallback_command(
@@ -196,6 +247,7 @@ def generate_thumbnail(
     tool: str | None = None,
     timeout: float = 180.0,
     cancel_event: threading.Event | None = None,
+    tonemap: str | None = None,
 ) -> str:
     """Generate and cache a PNG thumbnail, returning its absolute path."""
 
@@ -207,7 +259,8 @@ def generate_thumbnail(
     # Header sniffing is cheap and lets thumbnail jobs warm the UI resolution cache.
     resolution.probe_fast(source_path)
     size = max(32, min(2048, int(size)))
-    target = thumbnail_path(source_path, size=size, cache_dir=cache_dir)
+    tonemap = normalise_tonemap(tonemap)
+    target = thumbnail_path(source_path, size=size, cache_dir=cache_dir, tonemap=tonemap)
     if not force and target.is_file() and target.stat().st_size > 0:
         return str(target)
 
@@ -265,10 +318,14 @@ def generate_thumbnail(
                 if dimensions is not None:
                     resolution.store(source_path, *dimensions)
 
-            command = hoiiotool_command(hoiiotool, conversion_source, temporary_name, size)
-            # The recipe's color space names belong to Houdini's shipped OCIO
-            # config; a site OCIO variable would make them unresolvable.
-            ok, detail = _run(command, timeout, cancel_event, env=_ocio_environment())
+            command = hoiiotool_command(
+                hoiiotool, conversion_source, temporary_name, size, tonemap=tonemap
+            )
+            # The ACES recipe's color space names belong to Houdini's shipped
+            # OCIO config; a site OCIO variable would make them unresolvable.
+            # The neutral transform needs no OCIO at all.
+            environment = _ocio_environment() if tonemap == "aces" else None
+            ok, detail = _run(command, timeout, cancel_event, env=environment)
             if cancel_event is not None and cancel_event.is_set():
                 raise ThumbnailCancelled("Thumbnail generation cancelled")
             temporary = Path(temporary_name)
@@ -276,7 +333,7 @@ def generate_thumbnail(
                 os.replace(str(temporary), str(target))
                 return str(target)
             errors.append("{}: {}".format(hoiiotool, detail))
-            if _looks_like_ocio_failure(detail):
+            if tonemap == "aces" and _looks_like_ocio_failure(detail):
                 command = hoiiotool_fallback_command(
                     hoiiotool, conversion_source, temporary_name, size
                 )
@@ -346,6 +403,7 @@ def generate_thumbnails_parallel(
     on_result: Callable[[str, str], None] | None = None,
     on_error: Callable[[str, Exception], None] | None = None,
     on_progress: Callable[[int, int], None] | None = None,
+    tonemap: str | None = None,
 ) -> tuple[int, int, bool]:
     """Generate thumbnails concurrently and report completions from this thread.
 
@@ -364,6 +422,7 @@ def generate_thumbnails_parallel(
             cache_dir=cache_dir,
             force=force,
             cancel_event=event,
+            tonemap=tonemap,
         )
 
     return run_parallel(

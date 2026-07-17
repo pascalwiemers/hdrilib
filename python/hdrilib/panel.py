@@ -111,11 +111,12 @@ if QtCore is not None:
         problem = Signal(str, str)
         finished = Signal(bool)
 
-        def __init__(self, paths, size, workers):
+        def __init__(self, paths, size, workers, tonemap=None):
             super().__init__()
             self._paths = list(paths)
             self._size = int(size)
             self._workers = int(workers)
+            self._tonemap = tonemap
             self._cancelled = threading.Event()
 
         def cancel(self):
@@ -130,6 +131,7 @@ if QtCore is not None:
                     self._paths,
                     size=self._size,
                     workers=self._workers,
+                    tonemap=self._tonemap,
                     cancel_event=self._cancelled,
                     on_result=self.thumbnail_ready.emit,
                     on_error=lambda source, error: self.problem.emit(source, str(error)),
@@ -258,6 +260,9 @@ if QtCore is not None:
                         self._settings.get("prepare_generate_thumbnails", True)
                     ),
                     thumbnail_size=int(self._settings.get("thumbnail_size", 256)),
+                    thumbnail_tonemap=self._settings.get(
+                        "thumbnail_tonemap", thumbs.DEFAULT_TONEMAP
+                    ),
                     workers=int(
                         self._settings.get(
                             "thumbnail_workers", config.DEFAULT_THUMBNAIL_WORKERS
@@ -480,8 +485,18 @@ if QtCore is not None:
             self.thumbnail_workers_spin = QtWidgets.QSpinBox()
             self.thumbnail_workers_spin.setRange(1, 64)
             self.thumbnail_workers_spin.setKeyboardTracking(False)
+            self.thumbnail_tonemap_combo = QtWidgets.QComboBox()
+            self.thumbnail_tonemap_combo.addItem("Neutral (soft contrast)", "neutral")
+            self.thumbnail_tonemap_combo.addItem("ACES (filmic)", "aces")
+            self.thumbnail_tonemap_combo.setToolTip(
+                "Neutral compresses highlights with open shadows; ACES is contrastier."
+                " Changing this regenerates thumbnails on demand."
+            )
+            self.clear_thumbs_button = QtWidgets.QPushButton("Clear thumbnail cache")
             thumbnail_layout.addRow("Preview size", self.thumbnail_size_spin)
             thumbnail_layout.addRow("Parallel workers", self.thumbnail_workers_spin)
+            thumbnail_layout.addRow("Tone mapping", self.thumbnail_tonemap_combo)
+            thumbnail_layout.addRow("", self.clear_thumbs_button)
             options_grid.addWidget(thumbnail_group, 0, 1)
 
             rat_group = QtWidgets.QGroupBox("RAT Conversion")
@@ -540,6 +555,10 @@ if QtCore is not None:
             )
             self.thumbnail_size_spin.valueChanged.connect(self._thumbnail_settings_changed)
             self.thumbnail_workers_spin.valueChanged.connect(self._thumbnail_settings_changed)
+            self.thumbnail_tonemap_combo.currentIndexChanged.connect(
+                self._thumbnail_settings_changed
+            )
+            self.clear_thumbs_button.clicked.connect(self._clear_thumbnail_cache)
             self.rat_alongside_radio.toggled.connect(self._rat_settings_changed)
             self.rat_subfolder_radio.toggled.connect(self._rat_settings_changed)
             self.rat_subfolder_name.editingFinished.connect(self._rat_settings_changed)
@@ -567,6 +586,11 @@ if QtCore is not None:
                 int(self._settings.get("thumbnail_workers", config.DEFAULT_THUMBNAIL_WORKERS))
             )
             self.thumbnail_workers_spin.blockSignals(False)
+            self.thumbnail_tonemap_combo.blockSignals(True)
+            self.thumbnail_tonemap_combo.setCurrentIndex(
+                1 if self._settings.get("thumbnail_tonemap") == "aces" else 0
+            )
+            self.thumbnail_tonemap_combo.blockSignals(False)
             self.view_mode_combo.blockSignals(True)
             self.view_mode_combo.setCurrentIndex(
                 1 if self._settings.get("view_mode") == "list" else 0
@@ -1414,8 +1438,20 @@ if QtCore is not None:
         def _thumbnail_settings_changed(self, _value=None):
             self._settings["thumbnail_size"] = self.thumbnail_size_spin.value()
             self._settings["thumbnail_workers"] = self.thumbnail_workers_spin.value()
+            self._settings["thumbnail_tonemap"] = (
+                self.thumbnail_tonemap_combo.currentData() or thumbs.DEFAULT_TONEMAP
+            )
             self._save()
             self._apply_icon_size()
+            self._populate_grid()
+
+        def _clear_thumbnail_cache(self):
+            removed, freed = thumbs.clear_cache()
+            self.status.setText(
+                "Cleared {} cached thumbnail{} ({:.1f} MB).".format(
+                    removed, "" if removed == 1 else "s", freed / (1024 * 1024)
+                )
+            )
             self._populate_grid()
 
         def _update_rat_settings_enabled(self):
@@ -1475,6 +1511,7 @@ if QtCore is not None:
             visible = [path for path in self._all_files if query in os.path.basename(path).lower()]
             fallback_icon = self.style().standardIcon(STANDARD_FILE_ICON)
             size = int(self._settings.get("thumbnail_size", 256))
+            tonemap = self._settings.get("thumbnail_tonemap", thumbs.DEFAULT_TONEMAP)
             center_text = self._settings.get("view_mode", "grid") != "list"
             for path in visible:
                 item = QtWidgets.QListWidgetItem(os.path.basename(path))
@@ -1482,7 +1519,7 @@ if QtCore is not None:
                     item.setTextAlignment(ALIGN_CENTER)
                 item.setToolTip(path)
                 item.setData(USER_ROLE, path)
-                cached = thumbs.cached_thumbnail(path, size=size)
+                cached = thumbs.cached_thumbnail(path, size=size, tonemap=tonemap)
                 item.setIcon(QtGui.QIcon(cached) if cached else fallback_icon)
                 self.grid.addItem(item)
             self.status.setText(
@@ -1803,10 +1840,11 @@ if QtCore is not None:
             if self._thread is not None:
                 return
             size = int(self._settings.get("thumbnail_size", 256))
+            tonemap = self._settings.get("thumbnail_tonemap", thumbs.DEFAULT_TONEMAP)
             pending = [
                 path
                 for path in paths
-                if not thumbs.cached_thumbnail(path, size=size)
+                if not thumbs.cached_thumbnail(path, size=size, tonemap=tonemap)
             ]
             if not pending:
                 self.status.setText("All thumbnails for this scope are cached.")
@@ -1817,6 +1855,7 @@ if QtCore is not None:
                 pending,
                 size,
                 int(self._settings.get("thumbnail_workers", config.DEFAULT_THUMBNAIL_WORKERS)),
+                tonemap=tonemap,
             )
             worker.moveToThread(thread)
             thread.started.connect(worker.run)
