@@ -81,6 +81,7 @@ if QtCore is not None:
     ALIGN_CENTER = _enum(QtCore.Qt, "AlignmentFlag", "AlignCenter")
     HORIZONTAL = _enum(QtCore.Qt, "Orientation", "Horizontal")
     ICON_MODE = _enum(QtWidgets.QListView, "ViewMode", "IconMode")
+    LIST_MODE = _enum(QtWidgets.QListView, "ViewMode", "ListMode")
     ADJUST = _enum(QtWidgets.QListView, "ResizeMode", "Adjust")
     STATIC_MOVEMENT = _enum(QtWidgets.QListView, "Movement", "Static")
     EXTENDED_SELECTION = _enum(QtWidgets.QAbstractItemView, "SelectionMode", "ExtendedSelection")
@@ -372,9 +373,22 @@ if QtCore is not None:
                 format_menu.addAction(action)
                 self._format_actions[extension] = action
             self.format_button.setMenu(format_menu)
+            self.view_mode_combo = QtWidgets.QComboBox()
+            self.view_mode_combo.addItems(["Grid", "List"])
+            self.view_mode_combo.setToolTip("Switch between thumbnail grid and compact list")
+            self.icon_size_slider = QtWidgets.QSlider(HORIZONTAL)
+            self.icon_size_slider.setRange(48, 512)
+            self.icon_size_slider.setSingleStep(16)
+            self.icon_size_slider.setPageStep(64)
+            self.icon_size_slider.setFixedWidth(120)
+            self.icon_size_slider.setToolTip(
+                "Thumbnail display size (cache resolution is set in Settings)"
+            )
             filter_bar.addWidget(self.search, 1)
             filter_bar.addWidget(self.include_subfolders)
             filter_bar.addWidget(self.format_button)
+            filter_bar.addWidget(self.view_mode_combo)
+            filter_bar.addWidget(self.icon_size_slider)
             layout.addLayout(filter_bar)
 
             self.splitter = QtWidgets.QSplitter(HORIZONTAL)
@@ -406,6 +420,9 @@ if QtCore is not None:
             self.grid.customContextMenuRequested.connect(self._show_grid_context_menu)
             self.generate_button.clicked.connect(self._start_generation)
             self.cancel_button.clicked.connect(self._cancel_job)
+            self.view_mode_combo.currentIndexChanged.connect(self._view_mode_changed)
+            self.icon_size_slider.valueChanged.connect(self._display_size_changed)
+            self.icon_size_slider.sliderReleased.connect(self._save)
 
         def _build_settings_tab(self):
             layout = QtWidgets.QVBoxLayout(self.settings_tab)
@@ -550,6 +567,14 @@ if QtCore is not None:
                 int(self._settings.get("thumbnail_workers", config.DEFAULT_THUMBNAIL_WORKERS))
             )
             self.thumbnail_workers_spin.blockSignals(False)
+            self.view_mode_combo.blockSignals(True)
+            self.view_mode_combo.setCurrentIndex(
+                1 if self._settings.get("view_mode") == "list" else 0
+            )
+            self.view_mode_combo.blockSignals(False)
+            self.icon_size_slider.blockSignals(True)
+            self.icon_size_slider.setValue(int(self._settings.get("display_icon_size", 256)))
+            self.icon_size_slider.blockSignals(False)
             rat_mode = self._settings.get("rat_output_mode", "alongside")
             self.rat_alongside_radio.blockSignals(True)
             self.rat_subfolder_radio.blockSignals(True)
@@ -591,9 +616,33 @@ if QtCore is not None:
             )
 
         def _apply_icon_size(self):
-            size = int(self._settings.get("thumbnail_size", 256))
-            self.grid.setIconSize(QtCore.QSize(size, max(32, size // 2)))
-            self.grid.setGridSize(QtCore.QSize(size + 24, max(100, size // 2 + 48)))
+            size = int(self._settings.get("display_icon_size", 256))
+            if self._settings.get("view_mode", "grid") == "list":
+                height = max(24, size // 4)
+                self.grid.setViewMode(LIST_MODE)
+                self.grid.setWordWrap(False)
+                self.grid.setSpacing(1)
+                self.grid.setIconSize(QtCore.QSize(height * 2, height))
+                self.grid.setGridSize(QtCore.QSize())
+            else:
+                self.grid.setViewMode(ICON_MODE)
+                self.grid.setWordWrap(True)
+                self.grid.setSpacing(6)
+                self.grid.setIconSize(QtCore.QSize(size, max(32, size // 2)))
+                self.grid.setGridSize(QtCore.QSize(size + 24, max(100, size // 2 + 48)))
+
+        def _view_mode_changed(self, index):
+            self._settings["view_mode"] = "list" if index == 1 else "grid"
+            self._apply_icon_size()
+            self._save()
+            # Repopulate so item text alignment matches the new mode.
+            self._populate_grid()
+
+        def _display_size_changed(self, value):
+            self._settings["display_icon_size"] = int(value)
+            self._apply_icon_size()
+            if not self.icon_size_slider.isSliderDown():
+                self._save()
 
         def _save(self):
             self._settings["last_folder"] = self._folder or ""
@@ -1426,9 +1475,11 @@ if QtCore is not None:
             visible = [path for path in self._all_files if query in os.path.basename(path).lower()]
             fallback_icon = self.style().standardIcon(STANDARD_FILE_ICON)
             size = int(self._settings.get("thumbnail_size", 256))
+            center_text = self._settings.get("view_mode", "grid") != "list"
             for path in visible:
                 item = QtWidgets.QListWidgetItem(os.path.basename(path))
-                item.setTextAlignment(ALIGN_CENTER)
+                if center_text:
+                    item.setTextAlignment(ALIGN_CENTER)
                 item.setToolTip(path)
                 item.setData(USER_ROLE, path)
                 cached = thumbs.cached_thumbnail(path, size=size)

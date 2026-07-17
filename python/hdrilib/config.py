@@ -34,6 +34,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "location_ui_mode": "sidebar",
     "thumbnail_size": 256,
     "thumbnail_workers": DEFAULT_THUMBNAIL_WORKERS,
+    "display_icon_size": 256,
+    "view_mode": "grid",
     "rat_output_mode": "alongside",
     "rat_subfolder_name": "rat",
     "rat_overwrite_existing": False,
@@ -171,6 +173,14 @@ def normalise_config(data: Mapping[str, Any] | None) -> dict[str, Any]:
     workers = data.get("thumbnail_workers")
     if isinstance(workers, int) and not isinstance(workers, bool):
         result["thumbnail_workers"] = max(1, min(64, workers))
+
+    display_size = data.get("display_icon_size")
+    if isinstance(display_size, int) and not isinstance(display_size, bool):
+        result["display_icon_size"] = max(48, min(512, display_size))
+
+    view_mode = data.get("view_mode")
+    if view_mode in ("grid", "list"):
+        result["view_mode"] = view_mode
 
     rat_output_mode = data.get("rat_output_mode")
     if rat_output_mode in ("alongside", "subfolder"):
