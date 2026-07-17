@@ -384,6 +384,7 @@ def main(argv=None) -> int:
                 "/lib/studio.exr",
                 "/lib/studio_1k.exr",
                 "/lib/studio.exr.rat",
+                "/lib/studio.rat",
                 "/lib/1k/forest.exr",
                 "/lib/forest.exr",
                 "/lib/sunset_01.exr",
@@ -393,7 +394,10 @@ def main(argv=None) -> int:
         by_name = {group.name: group for group in groups}
         assert [v.label for v in by_name["church"].variants] == ["8k", "4k"]
         assert [v.label for v in by_name["studio"].variants] == ["native", "1k"]
-        assert by_name["studio"].variants[0].companions == ["/lib/studio.exr.rat"]
+        assert by_name["studio"].variants[0].companions == [
+            "/lib/studio.exr.rat",
+            "/lib/studio.rat",
+        ]
         assert [v.label for v in by_name["forest"].variants] == ["native", "1k"]
         assert len(by_name["sunset_01"].variants) == 1
         assert variants.pick_variant(by_name["church"], "highest").label == "8k"
@@ -403,8 +407,8 @@ def main(argv=None) -> int:
         print("PER-ROOT SCAN ok: RAT-only root differs from all-formats root")
 
         target_source = work / "targets" / "sunset.exr"
-        expected_alongside = target_source.parent / "sunset.exr.rat"
-        expected_subfolder = target_source.parent / "rat-cache" / "sunset.exr.rat"
+        expected_alongside = target_source.parent / "sunset.rat"
+        expected_subfolder = target_source.parent / "rat-cache" / "sunset.rat"
         assert convert.build_rat_target(target_source, "alongside", "ignored") == expected_alongside
         assert (
             convert.build_rat_target(target_source, "subfolder", "rat-cache")
@@ -416,6 +420,39 @@ def main(argv=None) -> int:
             pass
         else:
             raise AssertionError("unsafe RAT subfolder was accepted")
+
+        collision_exr = work / "collision" / "sky.exr"
+        collision_hdr = work / "collision" / "sky.hdr"
+        collision_exr.parent.mkdir()
+        collision_exr.write_bytes(b"exr")
+        collision_hdr.write_bytes(b"hdr")
+        allocated = convert.allocate_rat_targets(
+            [collision_exr, collision_hdr], "alongside", "rat"
+        )
+        assert allocated[str(collision_exr)] == collision_exr.with_suffix(".rat")
+        assert allocated[str(collision_hdr)] == collision_hdr.with_name("sky.hdr.rat")
+        assert convert.rat_collision_sources(collision_hdr) == [
+            str(collision_exr),
+            str(collision_hdr),
+        ]
+        collision_fallback = collision_hdr.with_name("sky.hdr.rat")
+        collision_fallback.write_bytes(b"collision-safe target")
+        collision_now = time.time()
+        os.utime(collision_exr, (collision_now - 10.0, collision_now - 10.0))
+        os.utime(collision_hdr, (collision_now - 10.0, collision_now - 10.0))
+        os.utime(collision_fallback, (collision_now, collision_now))
+        collision_skips = []
+        convert_to_rat_result = convert.convert_to_rat_parallel(
+            [collision_hdr],
+            executable=str(work / "must-not-run-iconvert"),
+            on_skipped=lambda source_path, target_path, reason: collision_skips.append(
+                (source_path, target_path, reason)
+            ),
+        )
+        assert convert_to_rat_result[:2] == (1, 1)
+        assert collision_skips == [
+            (str(collision_hdr), str(collision_fallback), "target_newer")
+        ]
 
         skip_source = work / "skip.hdr"
         skip_source.write_bytes(b"source")
@@ -430,6 +467,20 @@ def main(argv=None) -> int:
             executable=str(work / "must-not-run-iconvert"),
         )
         assert skipped.skipped and skipped.reason == "target_newer"
+        legacy_source = work / "legacy.hdr"
+        legacy_source.write_bytes(b"source")
+        legacy_target = convert.build_legacy_rat_target(
+            legacy_source, "alongside", "rat"
+        )
+        legacy_target.write_bytes(b"legacy target")
+        os.utime(legacy_source, (now - 10.0, now - 10.0))
+        os.utime(legacy_target, (now, now))
+        legacy_skipped = convert.convert_to_rat(
+            legacy_source,
+            overwrite=False,
+            executable=str(work / "must-not-run-iconvert"),
+        )
+        assert legacy_skipped.skipped and legacy_skipped.target == str(legacy_target)
         already_rat = work / "already.rat"
         already_rat.write_bytes(b"rat")
         skipped_rat = convert.convert_to_rat(
@@ -462,11 +513,35 @@ def main(argv=None) -> int:
         )
         converted_rat_source = naming_source.with_name("dome_16K.exr.rat")
         assert resize.build_resize_target(converted_rat_source, 2048, "alongside") == (
-            converted_rat_source.parent / "dome_2k.exr.rat"
+            converted_rat_source.parent / "dome_2k.rat"
         )
         assert resize.build_resize_target(converted_rat_source, 2048, "subfolder") == (
-            converted_rat_source.parent / "2k" / "dome.exr.rat"
+            converted_rat_source.parent / "2k" / "dome.rat"
         )
+        assert resize.build_resize_rat_target(naming_source, 2048, "alongside") == (
+            naming_source.parent / "dome_2k.rat"
+        )
+        resize_allocated = resize.allocate_resize_rat_targets(
+            [collision_exr, collision_hdr], 4096, "alongside"
+        )
+        assert resize_allocated[str(collision_exr)].name == "sky_4k.rat"
+        assert resize_allocated[str(collision_hdr)].name == "sky_4k.hdr.rat"
+        legacy_resize_source = work / "legacy-resize.exr"
+        legacy_resize_source.write_bytes(b"source")
+        legacy_resize_target = resize.build_legacy_resize_rat_target(
+            legacy_resize_source, 4096, "alongside"
+        )
+        legacy_resize_target.write_bytes(b"legacy low-res RAT")
+        os.utime(legacy_resize_source, (now - 10.0, now - 10.0))
+        os.utime(legacy_resize_target, (now, now))
+        resolution.store(legacy_resize_source, 9000, 4500)
+        legacy_resize_skipped = resize.resize_to_rung(
+            legacy_resize_source,
+            4096,
+            output_format="rat",
+        )
+        assert legacy_resize_skipped.skipped
+        assert legacy_resize_skipped.target == str(legacy_resize_target)
         eligible, too_small = resize.partition_by_width(
             {"16k": 16384, "4k": 4096, "small": 900}, 4096
         )
@@ -494,7 +569,7 @@ def main(argv=None) -> int:
         assert plan.resize_stages[0].sources == (str(large),)
         assert plan.resize_stages[0].targets == (
             str(prepare_root / "4k" / "nested" / "large.exr"),
-            str(prepare_root / "4k" / "nested" / "large.exr.rat"),
+            str(prepare_root / "4k" / "nested" / "large.rat"),
         )
         assert plan.resize_stages[1].sources == (str(large),)
         assert plan.total == 4  # two original conversions + two combined resizes
@@ -521,7 +596,7 @@ def main(argv=None) -> int:
             lowres_format="both",
         )
         native_target = str(prepare_root / "4k" / "nested" / "large.exr")
-        rat_target = native_target + ".rat"
+        rat_target = str(Path(native_target).with_suffix(".rat"))
         assert native_plan.resize_stages[0].targets == (native_target,)
         assert rat_only_plan.resize_stages[0].targets == (rat_target,)
         assert native_target not in rat_only_plan.resize_stages[0].targets
@@ -920,7 +995,7 @@ def main(argv=None) -> int:
             assert not conversion_skips, "forced RAT conversions were skipped"
             assert set(conversion_outputs) == set(conversion_sources)
             for source_path, output in conversion_outputs.items():
-                assert output.endswith(Path(source_path).name + ".rat")
+                assert Path(output).name == Path(source_path).stem + ".rat"
                 assert Path(output).parent.name == "rat"
                 assert Path(output).is_file() and Path(output).stat().st_size > 0
             print("PARALLEL RAT ok: 2 HDR/EXR files with 2 workers")

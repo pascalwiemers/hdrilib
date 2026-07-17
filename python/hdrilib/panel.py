@@ -93,6 +93,9 @@ if QtCore is not None:
     STATIC_MOVEMENT = _enum(QtWidgets.QListView, "Movement", "Static")
     EXTENDED_SELECTION = _enum(QtWidgets.QAbstractItemView, "SelectionMode", "ExtendedSelection")
     INSTANT_POPUP = _enum(QtWidgets.QToolButton, "ToolButtonPopupMode", "InstantPopup")
+    ADJUST_TO_CONTENTS = _enum(
+        QtWidgets.QComboBox, "SizeAdjustPolicy", "AdjustToContents"
+    )
     CUSTOM_CONTEXT_MENU = _enum(QtCore.Qt, "ContextMenuPolicy", "CustomContextMenu")
     STANDARD_FILE_ICON = _enum(QtWidgets.QStyle, "StandardPixmap", "SP_FileIcon")
     ITEM_IS_EDITABLE = _enum(QtCore.Qt, "ItemFlag", "ItemIsEditable")
@@ -390,6 +393,24 @@ if QtCore is not None:
                 "Show one entry per HDRI, combining _1k/_4k… suffix and rung-"
                 "subfolder variants. Hover an entry to see its files."
             )
+            self.browse_assign_resolution_label = QtWidgets.QLabel("Assign")
+            self.browse_assign_resolution_combo = QtWidgets.QComboBox()
+            self.browse_assign_resolution_combo.addItem("Highest", "highest")
+            self.browse_assign_resolution_combo.addItem("Lowest", "lowest")
+            for width, label in (
+                (1024, "1K"),
+                (2048, "2K"),
+                (4096, "4K"),
+                (8192, "8K"),
+                (16384, "16K"),
+            ):
+                self.browse_assign_resolution_combo.addItem(label, str(width))
+            self.browse_assign_resolution_combo.setToolTip(
+                "Resolution assigned when a grouped HDRI is double-clicked"
+            )
+            self.browse_assign_resolution_combo.setSizeAdjustPolicy(
+                ADJUST_TO_CONTENTS
+            )
             self.view_mode_combo = QtWidgets.QComboBox()
             self.view_mode_combo.addItems(["Grid", "List"])
             self.view_mode_combo.setToolTip("Switch between thumbnail grid and compact list")
@@ -404,6 +425,8 @@ if QtCore is not None:
             filter_bar.addWidget(self.search, 1)
             filter_bar.addWidget(self.include_subfolders)
             filter_bar.addWidget(self.group_resolutions)
+            filter_bar.addWidget(self.browse_assign_resolution_label)
+            filter_bar.addWidget(self.browse_assign_resolution_combo)
             filter_bar.addWidget(self.format_button)
             filter_bar.addWidget(self.view_mode_combo)
             filter_bar.addWidget(self.icon_size_slider)
@@ -441,6 +464,11 @@ if QtCore is not None:
             self.generate_button.clicked.connect(self._start_generation)
             self.cancel_button.clicked.connect(self._cancel_job)
             self.group_resolutions.toggled.connect(self._grouping_changed)
+            self.browse_assign_resolution_combo.currentIndexChanged.connect(
+                lambda _index: self._assign_resolution_changed(
+                    self.browse_assign_resolution_combo
+                )
+            )
             self.view_mode_combo.currentIndexChanged.connect(self._view_mode_changed)
             self.icon_size_slider.valueChanged.connect(self._display_size_changed)
             self.icon_size_slider.sliderReleased.connect(self._save)
@@ -592,7 +620,9 @@ if QtCore is not None:
                 self._thumbnail_settings_changed
             )
             self.assign_resolution_combo.currentIndexChanged.connect(
-                self._thumbnail_settings_changed
+                lambda _index: self._assign_resolution_changed(
+                    self.assign_resolution_combo
+                )
             )
             self.clear_thumbs_button.clicked.connect(self._clear_thumbnail_cache)
             self.rat_alongside_radio.toggled.connect(self._rat_settings_changed)
@@ -637,12 +667,25 @@ if QtCore is not None:
                 )
             )
             self.assign_resolution_combo.blockSignals(False)
+            self.browse_assign_resolution_combo.blockSignals(True)
+            self.browse_assign_resolution_combo.setCurrentIndex(
+                max(
+                    0,
+                    self.browse_assign_resolution_combo.findData(
+                        self._settings.get("assign_resolution", variants.DEFAULT_ASSIGN)
+                    ),
+                )
+            )
+            self.browse_assign_resolution_combo.blockSignals(False)
             self.group_resolutions.blockSignals(True)
             self.group_resolutions.setChecked(
                 bool(self._settings.get("group_resolutions", False))
             )
             self.group_resolutions.blockSignals(False)
             self.assign_resolution_combo.setEnabled(
+                bool(self._settings.get("group_resolutions", False))
+            )
+            self._set_browse_assign_visible(
                 bool(self._settings.get("group_resolutions", False))
             )
             self.view_mode_combo.blockSignals(True)
@@ -719,8 +762,26 @@ if QtCore is not None:
         def _grouping_changed(self, checked):
             self._settings["group_resolutions"] = bool(checked)
             self.assign_resolution_combo.setEnabled(bool(checked))
+            self._set_browse_assign_visible(bool(checked))
             self._save()
             self._populate_grid()
+
+        def _set_browse_assign_visible(self, visible):
+            self.browse_assign_resolution_label.setVisible(bool(visible))
+            self.browse_assign_resolution_combo.setVisible(bool(visible))
+
+        def _assign_resolution_changed(self, source_combo):
+            value = source_combo.currentData() or variants.DEFAULT_ASSIGN
+            other = (
+                self.assign_resolution_combo
+                if source_combo is self.browse_assign_resolution_combo
+                else self.browse_assign_resolution_combo
+            )
+            other.blockSignals(True)
+            other.setCurrentIndex(max(0, other.findData(value)))
+            other.blockSignals(False)
+            self._settings["assign_resolution"] = value
+            self._save()
 
         def _view_mode_changed(self, index):
             self._settings["view_mode"] = "list" if index == 1 else "grid"
@@ -1799,9 +1860,6 @@ if QtCore is not None:
             self._settings["thumbnail_workers"] = self.thumbnail_workers_spin.value()
             self._settings["thumbnail_tonemap"] = (
                 self.thumbnail_tonemap_combo.currentData() or thumbs.DEFAULT_TONEMAP
-            )
-            self._settings["assign_resolution"] = (
-                self.assign_resolution_combo.currentData() or variants.DEFAULT_ASSIGN
             )
             self._save()
             self._apply_icon_size()

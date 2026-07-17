@@ -9,8 +9,8 @@ Rules, in confidence order; anything unmatched stays ungrouped:
    from the path before comparison, so ``lib/1k/foo.exr`` groups with
    ``lib/foo.exr``.
 
-``foo.exr.rat`` next to a scanned ``foo.exr`` is treated as a format
-companion of that variant, never as its own entry.
+Both ``foo.rat`` and legacy ``foo.exr.rat`` next to a scanned ``foo.exr`` are
+treated as format companions of that variant, never as their own entries.
 """
 
 from __future__ import annotations
@@ -107,6 +107,22 @@ def build_groups(paths: Iterable[str]) -> list[Group]:
         if match and path[: -len(".rat")] in available:
             companions.setdefault(path[: -len(".rat")], []).append(path)
             continue
+        if path.lower().endswith(".rat"):
+            rat_stem = path[: -len(".rat")]
+            source = next(
+                (
+                    candidate
+                    for candidate in ordered
+                    if candidate != path
+                    and os.path.splitext(candidate)[0] == rat_stem
+                    and os.path.splitext(candidate)[1].lower()
+                    in (".exr", ".hdr", ".png", ".jpg", ".jpeg", ".tif", ".tiff")
+                ),
+                None,
+            )
+            if source is not None:
+                companions.setdefault(source, []).append(path)
+                continue
         members.append(path)
 
     grouped: dict[tuple[str, str], list[Variant]] = {}

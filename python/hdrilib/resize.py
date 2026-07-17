@@ -18,19 +18,6 @@ from .jobs import JobCancelled, run_parallel
 
 STANDARD_RUNGS = (16384, 8192, 4096, 2048, 1024)
 _RUNG_SUFFIX_RE = re.compile(r"_[0-9]+k$", re.IGNORECASE)
-_RAT_SOURCE_SUFFIXES = {
-    ".exr",
-    ".hdr",
-    ".tex",
-    ".tx",
-    ".png",
-    ".jpg",
-    ".jpeg",
-    ".tif",
-    ".tiff",
-}
-
-
 class ResizeError(RuntimeError):
     pass
 
@@ -89,14 +76,13 @@ def strip_rung_suffix(stem: str) -> str:
 
 
 def _variant_stem_and_suffix(source: Path) -> tuple[str, str]:
-    """Keep a source extension embedded by the existing ``name.ext.rat`` UX."""
+    """Normalize legacy ``name.ext.rat`` inputs to replaced-extension RAT names."""
 
     stem = source.stem
     suffix = source.suffix
     embedded = Path(stem).suffix
-    if suffix.lower() == ".rat" and embedded.lower() in _RAT_SOURCE_SUFFIXES:
+    if suffix.lower() == ".rat" and embedded:
         stem = Path(stem).stem
-        suffix = embedded + suffix
     return strip_rung_suffix(stem), suffix
 
 
@@ -139,7 +125,57 @@ def build_resize_rat_target(
     native = build_resize_target(
         source, target_width, mode, source_root=source_root, output_root=output_root
     )
+    return native if Path(source).suffix.lower() == ".rat" else native.with_suffix(".rat")
+
+
+def build_legacy_resize_rat_target(
+    source: str | os.PathLike[str],
+    target_width: int,
+    mode: str = "alongside",
+    source_root: str | os.PathLike[str] | None = None,
+    output_root: str | os.PathLike[str] | None = None,
+) -> Path:
+    """Build the historic ``name.ext.rat`` low-resolution target."""
+
+    native = build_resize_target(
+        source, target_width, mode, source_root=source_root, output_root=output_root
+    )
     return native if Path(source).suffix.lower() == ".rat" else Path(str(native) + ".rat")
+
+
+def allocate_resize_rat_targets(
+    paths: Iterable[str | os.PathLike[str]],
+    target_width: int,
+    mode: str = "alongside",
+    source_root: str | os.PathLike[str] | None = None,
+    output_root: str | os.PathLike[str] | None = None,
+) -> dict[str, Path]:
+    """Allocate collision-free RAT rung targets in input order."""
+
+    result: dict[str, Path] = {}
+    claimed = set()
+    for path in paths:
+        source = os.path.abspath(os.path.expanduser(os.fspath(path)))
+        if source in result:
+            continue
+        target = build_resize_rat_target(
+            source, target_width, mode, source_root=source_root, output_root=output_root
+        )
+        key = os.path.normcase(os.path.abspath(os.fspath(target)))
+        if key in claimed:
+            target = build_legacy_resize_rat_target(
+                source,
+                target_width,
+                mode,
+                source_root=source_root,
+                output_root=output_root,
+            )
+            key = os.path.normcase(os.path.abspath(os.fspath(target)))
+        if key in claimed:
+            raise ResizeError("Low-res RAT target collision for {}: {}".format(source, target))
+        claimed.add(key)
+        result[source] = target
+    return result
 
 
 def hoiiotool_resize_command(
@@ -283,6 +319,7 @@ def resize_to_rung(
     cancel_event: threading.Event | None = None,
     source_root: str | os.PathLike[str] | None = None,
     output_root: str | os.PathLike[str] | None = None,
+    rat_target: str | os.PathLike[str] | None = None,
 ) -> ResizeResult:
     """Create native, mipmapped RAT, or both low-res output formats."""
 
@@ -307,13 +344,16 @@ def resize_to_rung(
     selected_format = output_format or ("both" if also_rat else "native")
     if selected_format not in ("native", "rat", "both"):
         raise ValueError("Low-res output format must be 'native', 'rat', or 'both'")
-    rat_target = build_resize_rat_target(
-        source_path,
-        width,
-        mode,
-        source_root=source_root,
-        output_root=output_root,
-    )
+    if rat_target is not None:
+        rat_target = Path(rat_target).expanduser()
+    else:
+        rat_target = allocate_resize_rat_targets(
+            convert.rat_collision_sources(source_path),
+            width,
+            mode,
+            source_root=source_root,
+            output_root=output_root,
+        )[str(source_path)]
     if source_is_rat:
         targets = [native_target]
     elif selected_format == "native":
@@ -329,18 +369,34 @@ def resize_to_rung(
 
     try:
         source_mtime = source_path.stat().st_mtime_ns
-        needed = [
-            target
-            for target in targets
-            if overwrite
-            or not target.is_file()
-            or target.stat().st_mtime_ns < source_mtime
-        ]
+        needed = []
+        reported_targets = []
+        legacy_rat_target = build_legacy_resize_rat_target(
+            source_path,
+            width,
+            mode,
+            source_root=source_root,
+            output_root=output_root,
+        )
+        for output_target in targets:
+            existing = output_target
+            if (
+                rat_target is not None
+                and output_target == rat_target
+                and legacy_rat_target != rat_target
+                and not overwrite
+                and legacy_rat_target.is_file()
+                and legacy_rat_target.stat().st_mtime_ns >= source_mtime
+            ):
+                existing = legacy_rat_target
+            reported_targets.append(existing)
+            if overwrite or not existing.is_file() or existing.stat().st_mtime_ns < source_mtime:
+                needed.append(output_target)
     except OSError as error:
         raise ResizeError(str(error)) from error
     if not needed:
         return ResizeResult(
-            str(source_path), tuple(str(target) for target in targets), "skipped", "target_newer"
+            str(source_path), tuple(str(target) for target in reported_targets), "skipped", "target_newer"
         )
 
     oiio = hoiiotool or houdini_executable("hoiiotool")
@@ -362,7 +418,11 @@ def resize_to_rung(
             cancel_event,
             force_float=source_path.suffix.lower() in (".hdr", ".exr"),
         )
-        return ResizeResult(str(source_path), tuple(str(target) for target in targets), "resized")
+        return ResizeResult(
+            str(source_path),
+            tuple(str(target) for target in reported_targets),
+            "resized",
+        )
 
     with tempfile.TemporaryDirectory(prefix="hdrilib-resize-") as temporary_dir:
         temporary_root = Path(temporary_dir)
@@ -408,7 +468,11 @@ def resize_to_rung(
                 cancel_event,
                 force_float=source_path.suffix.lower() in (".hdr", ".exr"),
             )
-    return ResizeResult(str(source_path), tuple(str(target) for target in targets), "resized")
+    return ResizeResult(
+        str(source_path),
+        tuple(str(target) for target in reported_targets),
+        "resized",
+    )
 
 
 def resize_to_rung_parallel(
@@ -434,6 +498,13 @@ def resize_to_rung_parallel(
         if source not in seen:
             seen.add(source)
             sources.append(source)
+    rat_targets = allocate_resize_rat_targets(
+        convert.rat_collision_source_union(sources),
+        target_width,
+        mode,
+        source_root=source_root,
+        output_root=output_root,
+    )
 
     def worker(source: str, event: threading.Event) -> ResizeResult:
         return resize_to_rung(
@@ -446,6 +517,7 @@ def resize_to_rung_parallel(
             cancel_event=event,
             source_root=source_root,
             output_root=output_root,
+            rat_target=rat_targets[source],
         )
 
     def result(source: str, resized: ResizeResult) -> None:

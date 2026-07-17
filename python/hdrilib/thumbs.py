@@ -190,8 +190,9 @@ def rat_sibling_source(path: Path) -> Path | None:
     """Return the RAT's original image when it sits nearby.
 
     Reading RAT through iconvert checks out a Houdini license; the original
-    holds the same pixels, so prefer it. Covers ``foo.exr.rat`` alongside and
-    the ``rat/`` subfolder layout (original one directory up).
+    holds the same pixels, so prefer it. Covers both ``foo.rat`` and legacy
+    ``foo.exr.rat`` alongside, plus the ``rat/`` subfolder layout (original one
+    directory up).
     """
 
     stem = path.name[: -len(".rat")]

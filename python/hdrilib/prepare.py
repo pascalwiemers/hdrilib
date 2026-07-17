@@ -188,6 +188,19 @@ def build_pipeline_plan(
         seen_rungs.add(width)
         candidates = []
         targets = []
+        eligible = [
+            source
+            for source in unique
+            if normalized_widths.get(_path_key(source)) is None
+            or int(normalized_widths[_path_key(source)]) > width
+        ]
+        rat_targets = resize.allocate_resize_rat_targets(
+            convert.rat_collision_source_union(eligible),
+            width,
+            "subfolder",
+            source_root=root_path,
+            output_root=root_path,
+        )
         for source in unique:
             source_width = normalized_widths.get(_path_key(source))
             if source_width is not None and int(source_width) <= width:
@@ -200,13 +213,7 @@ def build_pipeline_plan(
                 source_root=root_path,
                 output_root=root_path,
             )
-            rat_target = resize.build_resize_rat_target(
-                source,
-                width,
-                "subfolder",
-                source_root=root_path,
-                output_root=root_path,
-            )
+            rat_target = rat_targets[source]
             if Path(source).suffix.lower() == ".rat" or lowres_format == "native":
                 targets.append(str(native_target))
             elif lowres_format == "rat":
@@ -294,22 +301,26 @@ def final_thumbnail_paths(
     generated = [target for stage in plan.resize_stages for target in stage.targets]
     candidates.extend(generated)
     if plan.convert_originals:
+        rat_targets = convert.allocate_rat_targets(
+            convert.rat_collision_source_union(plan.sources),
+            rat_mode,
+            rat_subfolder_name,
+        )
         candidates.extend(
-            str(convert.build_rat_target(source, rat_mode, rat_subfolder_name))
+            str(rat_targets[_absolute_path(source)])
             for source in plan.sources
         )
     if resize_also_rat and plan.lowres_format == "native":
         for stage in plan.resize_stages:
+            rat_targets = resize.allocate_resize_rat_targets(
+                convert.rat_collision_source_union(stage.sources),
+                stage.width,
+                "subfolder",
+                source_root=plan.root,
+                output_root=plan.root,
+            )
             candidates.extend(
-                str(
-                    resize.build_resize_rat_target(
-                        source,
-                        stage.width,
-                        "subfolder",
-                        source_root=plan.root,
-                        output_root=plan.root,
-                    )
-                )
+                str(rat_targets[_absolute_path(source)])
                 for source in stage.sources
             )
 

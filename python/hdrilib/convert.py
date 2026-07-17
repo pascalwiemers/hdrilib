@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 
+from . import config, files
 from .houdini import executable as houdini_executable
 from .houdini import run_subprocess
 from .jobs import JobCancelled, run_parallel
@@ -47,7 +48,7 @@ def _subfolder_name(value: object) -> str:
 def build_rat_target(
     source: str | os.PathLike[str], mode: str, subfolder_name: str
 ) -> Path:
-    """Build a RAT target by appending ``.rat`` to the source's full filename."""
+    """Build a RAT target by replacing the source filename extension."""
 
     source_path = Path(source).expanduser()
     if mode == "alongside":
@@ -56,7 +57,84 @@ def build_rat_target(
         directory = source_path.parent / _subfolder_name(subfolder_name)
     else:
         raise ValueError("RAT output mode must be 'alongside' or 'subfolder'")
-    return directory / (source_path.name + ".rat")
+    return directory / (source_path.stem + ".rat")
+
+
+def build_legacy_rat_target(
+    source: str | os.PathLike[str], mode: str, subfolder_name: str
+) -> Path:
+    """Build the historic appended-extension RAT target used by older libraries."""
+
+    source_path = Path(source).expanduser()
+    target = build_rat_target(source_path, mode, subfolder_name)
+    return target.parent / (source_path.name + ".rat")
+
+
+def allocate_rat_targets(
+    paths: Iterable[str | os.PathLike[str]], mode: str, subfolder_name: str
+) -> dict[str, Path]:
+    """Allocate collision-free targets, retaining input order for precedence.
+
+    The first source for a replaced-extension name receives that name. Later
+    same-stem sources use the legacy appended-extension spelling so concurrent
+    jobs can never write the same file.
+    """
+
+    result: dict[str, Path] = {}
+    claimed = set()
+    for path in paths:
+        source = os.path.abspath(os.path.expanduser(os.fspath(path)))
+        if source in result:
+            continue
+        target = build_rat_target(source, mode, subfolder_name)
+        key = os.path.normcase(os.path.abspath(os.fspath(target)))
+        if key in claimed:
+            target = build_legacy_rat_target(source, mode, subfolder_name)
+            key = os.path.normcase(os.path.abspath(os.fspath(target)))
+        if key in claimed:
+            raise RatConversionError(
+                "RAT target collision for {}: {}".format(source, target)
+            )
+        claimed.add(key)
+        result[source] = target
+    return result
+
+
+def rat_collision_sources(source: str | os.PathLike[str]) -> list[str]:
+    """Return supported same-folder sources that share a replaced RAT stem."""
+
+    source_path = Path(source).expanduser().resolve()
+    stem = os.path.normcase(source_path.stem)
+    peers = [
+        path
+        for path in files.scan_files(
+            source_path.parent,
+            extensions=config.DEFAULT_EXTENSIONS,
+            recursive=False,
+        )
+        if Path(path).suffix.lower() != ".rat"
+        and os.path.normcase(Path(path).stem) == stem
+    ]
+    source_text = str(source_path)
+    if source_text not in peers:
+        peers.append(source_text)
+        peers.sort(key=lambda value: (value.lower(), value))
+    return peers
+
+
+def rat_collision_source_union(
+    paths: Iterable[str | os.PathLike[str]],
+) -> list[str]:
+    """Expand requested sources with same-stem siblings, preserving scan order."""
+
+    result = []
+    seen = set()
+    for path in paths:
+        for peer in rat_collision_sources(path):
+            if peer not in seen:
+                seen.add(peer)
+                result.append(peer)
+    return result
 
 
 def iconvert_rat_command(
@@ -184,6 +262,7 @@ def convert_to_rat(
     executable: str | None = None,
     timeout: float = 600.0,
     cancel_event: threading.Event | None = None,
+    target: str | os.PathLike[str] | None = None,
 ) -> RatConversionResult:
     """Convert one texture to RAT, or return a result describing why it was skipped."""
 
@@ -197,24 +276,41 @@ def convert_to_rat(
             str(source_path), str(source_path), "skipped", "already_rat"
         )
 
-    target = build_rat_target(source_path, mode, subfolder_name)
+    if target is not None:
+        selected_target = Path(target).expanduser()
+    else:
+        selected_target = allocate_rat_targets(
+            rat_collision_sources(source_path), mode, subfolder_name
+        )[str(source_path)]
+    candidates = [selected_target]
+    legacy_target = build_legacy_rat_target(source_path, mode, subfolder_name)
+    if legacy_target != selected_target:
+        candidates.append(legacy_target)
     try:
-        up_to_date = target.is_file() and target.stat().st_mtime_ns >= source_path.stat().st_mtime_ns
+        source_mtime = source_path.stat().st_mtime_ns
+        up_to_date_target = next(
+            (
+                candidate
+                for candidate in candidates
+                if candidate.is_file() and candidate.stat().st_mtime_ns >= source_mtime
+            ),
+            None,
+        )
     except OSError as error:
         raise RatConversionError(str(error)) from error
-    if up_to_date and not overwrite:
+    if up_to_date_target is not None and not overwrite:
         return RatConversionResult(
-            str(source_path), str(target), "skipped", "target_newer"
+            str(source_path), str(up_to_date_target), "skipped", "target_newer"
         )
 
     write_rat(
         source_path,
-        target,
+        selected_target,
         executable=executable,
         timeout=timeout,
         cancel_event=cancel_event,
     )
-    return RatConversionResult(str(source_path), str(target), "converted")
+    return RatConversionResult(str(source_path), str(selected_target), "converted")
 
 
 def convert_to_rat_parallel(
@@ -239,6 +335,9 @@ def convert_to_rat_parallel(
         if source not in seen:
             seen.add(source)
             sources.append(source)
+    targets = allocate_rat_targets(
+        rat_collision_source_union(sources), mode, subfolder_name
+    )
 
     def worker(source: str, event: threading.Event) -> RatConversionResult:
         return convert_to_rat(
@@ -248,6 +347,7 @@ def convert_to_rat_parallel(
             overwrite=overwrite,
             executable=executable,
             cancel_event=event,
+            target=targets[source],
         )
 
     def result(source: str, conversion: RatConversionResult) -> None:
