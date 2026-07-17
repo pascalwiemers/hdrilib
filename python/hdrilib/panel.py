@@ -823,7 +823,9 @@ if QtCore is not None:
             add_roots = QtWidgets.QCheckBox(
                 "Add generated subfolders to folder list"
             )
-            add_roots.setChecked(True)
+            add_roots.setChecked(
+                bool(self._settings.get("prepare_auto_add_subfolders", True))
+            )
             layout.addWidget(add_roots)
             buttons = QtWidgets.QDialogButtonBox(DIALOG_OK | DIALOG_CANCEL)
             buttons.accepted.connect(dialog.accept)
@@ -865,7 +867,9 @@ if QtCore is not None:
             add_roots = QtWidgets.QCheckBox(
                 "Add generated subfolders to folder list"
             )
-            add_roots.setChecked(True)
+            add_roots.setChecked(
+                bool(self._settings.get("prepare_auto_add_subfolders", True))
+            )
             layout.addWidget(add_roots)
             buttons = QtWidgets.QDialogButtonBox(DIALOG_OK | DIALOG_CANCEL)
             buttons.accepted.connect(dialog.accept)
@@ -1477,6 +1481,9 @@ if QtCore is not None:
             thread.start()
 
         def _start_root_prepare(self, plan, add_roots, description):
+            if bool(self._settings.get("prepare_auto_add_subfolders", True)) != bool(add_roots):
+                self._settings["prepare_auto_add_subfolders"] = bool(add_roots)
+                self._save()
             if self._thread is not None or not plan.total:
                 if not plan.total:
                     self.status.setText("No matching work was found for this action.")

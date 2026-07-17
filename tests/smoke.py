@@ -130,7 +130,7 @@ def main(argv=None) -> int:
                 stream,
             )
         migrated = config.load_config(config_file)
-        assert migrated["version"] == 5
+        assert migrated["version"] == config.SCHEMA_VERSION
         assert migrated["roots"] == [
             {
                 "path": str(source),
@@ -169,7 +169,7 @@ def main(argv=None) -> int:
                 stream,
             )
         migrated_v2 = config.load_config(config_file)
-        assert migrated_v2["version"] == 5
+        assert migrated_v2["version"] == config.SCHEMA_VERSION
         assert migrated_v2["roots"] == [
             {
                 "path": str(source),
@@ -209,7 +209,7 @@ def main(argv=None) -> int:
                 "unknown_key": "discard me",
             }
         )
-        assert strict["version"] == 5
+        assert strict["version"] == config.SCHEMA_VERSION
         assert strict["roots"] == [
             {
                 "path": str(source),
