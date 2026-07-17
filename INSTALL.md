@@ -17,8 +17,7 @@ Supported platforms: **Linux and macOS**, Houdini **20.5+** (developed on 22.0).
    for `.rat` files need a working license server (`hserver`); pure browsing does not.
 2. **Git and Python 3** are available (`git --version`, `python3 --version`).
    `install.py` uses only the standard library.
-3. Access to the repo: `https://github.com/pascalwiemers/hdrilib` (private — the
-   machine needs GitHub credentials or an SSH key for `pascalwiemers`).
+3. Access to the repo: `https://github.com/pascalwiemers/hdrilib` (public).
 
 ## 1. Clone
 
@@ -48,6 +47,36 @@ python3 install.py --version 22.0
 The generated package file sets `$HDRILIB` to the repo, prepends `$HDRILIB/python`
 to `PYTHONPATH`, and adds the repo to `HOUDINI_PATH` (which exposes
 `python_panels/hdrilib.pypanel`). No files are copied — the repo is the install.
+`--mode symlink` keeps the installed descriptor as a symlink to a generated
+descriptor under `~/.houdini_hdrilib/package/`.
+
+### Manual package install (no install.py)
+
+Create `hdrilib.json` in `$HOUDINI_USER_PREF_DIR/packages/` with the following
+content, replacing `/absolute/path/to/hdrilib` with this repository's absolute path
+(forward slashes on both macOS and Linux):
+
+```json
+{
+  "enable": true,
+  "load_package_once": true,
+  "env": [
+    { "HDRILIB": "/absolute/path/to/hdrilib" },
+    {
+      "PYTHONPATH": {
+        "value": "$HDRILIB/python",
+        "method": "prepend"
+      }
+    }
+  ],
+  "hpath": "$HDRILIB"
+}
+```
+
+For a centrally managed install, set `HDRILIB_ROOT` before Houdini starts and copy
+the repository's `hdrilib.json` into a scanned package directory; if the repository
+itself is in `HOUDINI_PACKAGE_DIR`, its checked-in package file resolves relative to
+that directory.
 
 ## 3. Verify headless (before launching the UI)
 
