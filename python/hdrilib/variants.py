@@ -9,8 +9,10 @@ Rules, in confidence order; anything unmatched stays ungrouped:
    from the path before comparison, so ``lib/1k/foo.exr`` groups with
    ``lib/foo.exr``.
 
-Both ``foo.rat`` and legacy ``foo.exr.rat`` next to a scanned ``foo.exr`` are
-treated as format companions of that variant, never as their own entries.
+The source format is not part of the group key, so RAT-only rungs still join a
+native EXR/HDR master.  Both ``foo.rat`` and legacy ``foo.exr.rat`` next to a
+scanned ``foo.exr`` are treated as format companions of that variant, never as
+their own entries.
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ from typing import Iterable, Mapping
 _TOKEN_RE = re.compile(r"[_\-. ]((\d{1,3})k)$", re.IGNORECASE)
 _RES_DIR_RE = re.compile(r"^(\d{1,3})k$", re.IGNORECASE)
 _RAT_SOURCE_RE = re.compile(r"\.(exr|hdr|png|jpg|jpeg|tif|tiff)\.rat$", re.IGNORECASE)
+_SOURCE_EXTENSIONS = (".exr", ".hdr", ".png", ".jpg", ".jpeg", ".tif", ".tiff")
 
 ASSIGN_CHOICES = ("highest", "lowest", "1024", "2048", "4096", "8192", "16384")
 DEFAULT_ASSIGN = "highest"
@@ -70,11 +73,22 @@ class Group:
         return " · ".join(variant.label for variant in self.variants)
 
 
+def _logical_stem(path: str) -> str:
+    """Return a stem with RAT's optional embedded source extension removed."""
+
+    stem, extension = os.path.splitext(os.path.basename(path))
+    if extension.lower() == ".rat":
+        embedded_stem, embedded_extension = os.path.splitext(stem)
+        if embedded_extension.lower() in _SOURCE_EXTENSIONS:
+            stem = embedded_stem
+    return stem
+
+
 def _identity(path: str) -> tuple[tuple[str, str], str | None]:
     """Return the group key and resolution token for one scanned file."""
 
     directory, name = os.path.split(path)
-    stem, extension = os.path.splitext(name)
+    stem = _logical_stem(name)
     base, token = split_token(stem)
     parent_dir, leaf = os.path.split(directory)
     if token is None and _RES_DIR_RE.match(leaf or ""):
@@ -82,7 +96,7 @@ def _identity(path: str) -> tuple[tuple[str, str], str | None]:
         directory = parent_dir
     key = (
         os.path.normcase(directory),
-        os.path.normcase(base) + os.path.normcase(extension),
+        os.path.normcase(base),
     )
     return key, token
 
@@ -102,10 +116,12 @@ def build_groups(paths: Iterable[str]) -> list[Group]:
     available = set(ordered)
     companions: dict[str, list[str]] = {}
     members = []
+    claimed_companions = set()
     for path in ordered:
         match = _RAT_SOURCE_RE.search(path)
         if match and path[: -len(".rat")] in available:
             companions.setdefault(path[: -len(".rat")], []).append(path)
+            claimed_companions.add(path)
             continue
         if path.lower().endswith(".rat"):
             rat_stem = path[: -len(".rat")]
@@ -122,8 +138,37 @@ def build_groups(paths: Iterable[str]) -> list[Group]:
             )
             if source is not None:
                 companions.setdefault(source, []).append(path)
+                claimed_companions.add(path)
                 continue
         members.append(path)
+
+    # A RAT-only rung can contain both current ``foo_4k.rat`` and historic
+    # ``foo_4k.exr.rat`` spellings without the native source being present.
+    # Keep one variant for that rung and expose the other spellings as format
+    # companions, just as we do when the native source is present.
+    rat_aliases: dict[tuple[str, str], list[str]] = {}
+    for path in members:
+        if path.lower().endswith(".rat"):
+            alias_key = (
+                os.path.normcase(os.path.dirname(path)),
+                os.path.normcase(_logical_stem(path)),
+            )
+            rat_aliases.setdefault(alias_key, []).append(path)
+    for aliases in rat_aliases.values():
+        if len(aliases) < 2:
+            continue
+        primary = min(
+            aliases,
+            key=lambda path: (
+                bool(_RAT_SOURCE_RE.search(path)),
+                ordered.index(path),
+            ),
+        )
+        for alias in aliases:
+            if alias != primary:
+                companions.setdefault(primary, []).append(alias)
+                claimed_companions.add(alias)
+    members = [path for path in members if path not in claimed_companions]
 
     grouped: dict[tuple[str, str], list[Variant]] = {}
     order: list[tuple[str, str]] = []
@@ -139,7 +184,7 @@ def build_groups(paths: Iterable[str]) -> list[Group]:
     groups = []
     for key in order:
         variants = sorted(grouped[key], key=_variant_sort)
-        stem, _extension = os.path.splitext(os.path.basename(variants[0].path))
+        stem = _logical_stem(variants[0].path)
         base, _token = split_token(stem)
         name = base.rstrip("_-. ") or stem
         groups.append(Group(name, variants))
@@ -171,6 +216,9 @@ def pick_variant(
     if preference == "highest":
         return max(group.variants, key=lambda variant: (width_of(variant), variant.path))
     target = int(preference)
+    exact = [variant for variant in group.variants if token_width(variant.token) == target]
+    if exact:
+        return min(exact, key=lambda variant: variant.path)
     return min(
         group.variants,
         key=lambda variant: (abs(width_of(variant) - target), width_of(variant), variant.path),

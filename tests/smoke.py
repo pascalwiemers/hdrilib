@@ -385,25 +385,85 @@ def main(argv=None) -> int:
                 "/lib/studio_1k.exr",
                 "/lib/studio.exr.rat",
                 "/lib/studio.rat",
+                "/lib/studio_8k.rat",
+                "/lib/studio_8k.exr.rat",
+                "/lib/4k/studio.hdr",
+                "/lib/4k/studio.rat",
+                "/lib/4k/studio.hdr.rat",
                 "/lib/1k/forest.exr",
                 "/lib/forest.exr",
+                "/lib/warehouse.rat",
+                "/lib/warehouse_4k.rat",
+                "/lib/2k/warehouse.rat",
                 "/lib/sunset_01.exr",
                 "/lib/sunset_02.exr",
             ]
         )
+        assert [group.name for group in groups].count("studio") == 1
+        assert [group.name for group in groups].count("warehouse") == 1
         by_name = {group.name: group for group in groups}
         assert [v.label for v in by_name["church"].variants] == ["8k", "4k"]
-        assert [v.label for v in by_name["studio"].variants] == ["native", "1k"]
+        assert [v.label for v in by_name["studio"].variants] == [
+            "native",
+            "8k",
+            "4k",
+            "1k",
+        ]
         assert by_name["studio"].variants[0].companions == [
             "/lib/studio.exr.rat",
             "/lib/studio.rat",
         ]
+        assert by_name["studio"].variants[1].path == "/lib/studio_8k.rat"
+        assert by_name["studio"].variants[1].companions == [
+            "/lib/studio_8k.exr.rat"
+        ]
+        assert by_name["studio"].variants[2].path == "/lib/4k/studio.hdr"
+        assert by_name["studio"].variants[2].companions == [
+            "/lib/4k/studio.rat",
+            "/lib/4k/studio.hdr.rat",
+        ]
+        studio_files = {
+            path
+            for variant in by_name["studio"].variants
+            for path in [variant.path, *variant.companions]
+        }
+        assert studio_files == {
+            "/lib/studio.exr",
+            "/lib/studio_1k.exr",
+            "/lib/studio.exr.rat",
+            "/lib/studio.rat",
+            "/lib/studio_8k.rat",
+            "/lib/studio_8k.exr.rat",
+            "/lib/4k/studio.hdr",
+            "/lib/4k/studio.rat",
+            "/lib/4k/studio.hdr.rat",
+        }
         assert [v.label for v in by_name["forest"].variants] == ["native", "1k"]
+        assert [v.label for v in by_name["warehouse"].variants] == [
+            "native",
+            "4k",
+            "2k",
+        ]
+        assert variants.pick_variant(by_name["warehouse"], "highest").path == (
+            "/lib/warehouse.rat"
+        )
         assert len(by_name["sunset_01"].variants) == 1
         assert variants.pick_variant(by_name["church"], "highest").label == "8k"
         assert variants.pick_variant(by_name["church"], "1024").label == "4k"
         assert variants.pick_variant(by_name["studio"], "lowest").label == "1k"
-        print("VARIANTS ok: suffix/rung-subfolder grouping, rat companions, picks")
+        assert (
+            variants.pick_variant(
+                by_name["studio"],
+                "highest",
+                {"/lib/studio.exr": 12000},
+            ).path
+            == "/lib/studio.exr"
+        )
+        assert variants.pick_variant(by_name["studio"], "4096").path == (
+            "/lib/4k/studio.hdr"
+        )
+        assert variants.pick_variant(by_name["studio"], "2048").label == "1k"
+        print("VARIANTS ok: originals, suffix/subfolder rungs, RAT forms, picks")
         print("PER-ROOT SCAN ok: RAT-only root differs from all-formats root")
 
         target_source = work / "targets" / "sunset.exr"
