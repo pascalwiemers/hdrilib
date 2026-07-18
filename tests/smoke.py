@@ -709,8 +709,8 @@ def main(argv=None) -> int:
         assert plan.rungs == (4096, 2048)
         assert plan.resize_stages[0].sources == (str(large),)
         assert plan.resize_stages[0].targets == (
-            str(prepare_root / "4k" / "nested" / "large.exr"),
-            str(prepare_root / "4k" / "nested" / "large.rat"),
+            str(prepare_root / "nested" / "4k" / "large.exr"),
+            str(prepare_root / "nested" / "4k" / "large.rat"),
         )
         assert plan.resize_stages[1].sources == (str(large),)
         assert plan.total == 4  # two original conversions + two combined resizes
@@ -736,7 +736,7 @@ def main(argv=None) -> int:
             widths={str(large): 9000},
             lowres_format="both",
         )
-        native_target = str(prepare_root / "4k" / "nested" / "large.exr")
+        native_target = str(prepare_root / "nested" / "4k" / "large.exr")
         rat_target = str(Path(native_target).with_suffix(".rat"))
         assert native_plan.resize_stages[0].targets == (native_target,)
         assert rat_only_plan.resize_stages[0].targets == (rat_target,)

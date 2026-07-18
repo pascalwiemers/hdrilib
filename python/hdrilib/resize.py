@@ -112,7 +112,10 @@ def build_resize_target(
                 )
             except ValueError as error:
                 raise ValueError("Resize source must be inside source_root") from error
-            return output_base / label / relative_parent / (stem + suffix)
+            # Keep the rung folder next to the file's own category folder
+            # (Nature/4k/foo) rather than at the library root (4k/Nature/foo),
+            # so variant grouping can connect the rung back to its original.
+            return output_base / relative_parent / label / (stem + suffix)
         return source_path.parent / label / (stem + suffix)
     raise ValueError("Low-res output mode must be 'alongside' or 'subfolder'")
 
