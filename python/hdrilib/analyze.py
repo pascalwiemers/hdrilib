@@ -83,6 +83,8 @@ class SourceAnalysis:
     has_suffix_variants: bool
     has_rung_folders: bool
     has_legacy_rat_names: bool
+    category_subfolders: tuple[str, ...]
+    categories_predominant: bool
     notes: tuple[str, ...]
 
     @property
@@ -133,6 +135,30 @@ def analyze_paths(
     groups = tuple(variants.build_groups(ordered, rat_subfolder_name))
     originals = tuple(
         dict.fromkeys(path for group in groups for path in _group_originals(group))
+    )
+
+    category_counts: Counter[str] = Counter()
+    excluded_top_level = {rat_subfolder_name.casefold()}
+    structure_image_count = 0
+    for original in originals:
+        try:
+            relative = Path(original).relative_to(root_path)
+        except ValueError:
+            continue
+        if len(relative.parts) < 2:
+            structure_image_count += 1
+            continue
+        first = relative.parts[0]
+        if first.casefold() in excluded_top_level or _RUNG_DIRECTORY.match(first):
+            continue
+        category_counts[first] += 1
+        structure_image_count += 1
+    category_subfolders = tuple(
+        sorted(category_counts, key=lambda value: (value.casefold(), value))
+    )
+    category_image_count = sum(category_counts.values())
+    categories_predominant = bool(category_subfolders) and (
+        category_image_count * 2 > structure_image_count
     )
 
     formats = Counter(files.extension_for(path, config.DEFAULT_EXTENSIONS) for path in ordered)
@@ -227,6 +253,8 @@ def analyze_paths(
         has_suffix_variants=suffix_variants,
         has_rung_folders=rung_folders,
         has_legacy_rat_names=legacy_rat,
+        category_subfolders=category_subfolders,
+        categories_predominant=categories_predominant,
         notes=tuple(notes),
     )
 

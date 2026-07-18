@@ -24,7 +24,7 @@ DEFAULT_EXTENSIONS = (
     ".tiff",
 )
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 DEFAULT_THUMBNAIL_WORKERS = min(8, os.cpu_count() or 1)
 _COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 _VARIABLE_RE = re.compile(
@@ -51,6 +51,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "lowres_overwrite_existing": False,
     "prepare_auto_add_subfolders": True,
     "prepare_generate_thumbnails": True,
+    "prepare_add_category_subfolders": True,
     "prepare_lowres_format": "both",
     "import_destination": "",
     "include_subfolders": False,
@@ -300,6 +301,7 @@ def normalise_config(data: Mapping[str, Any] | None) -> dict[str, Any]:
         "lowres_overwrite_existing",
         "prepare_auto_add_subfolders",
         "prepare_generate_thumbnails",
+        "prepare_add_category_subfolders",
     ):
         value = data.get(key)
         if isinstance(value, bool):

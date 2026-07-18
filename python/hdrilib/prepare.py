@@ -435,7 +435,11 @@ def finished_import_root_entry(
 
 
 def finished_import_config(
-    settings: Mapping[str, object], plan: PipelinePlan
+    settings: Mapping[str, object],
+    plan: PipelinePlan,
+    *,
+    add_category_subfolders: bool = False,
+    category_subfolders: Iterable[str] = (),
 ) -> dict[str, object]:
     """Return normalized settings after landing a completed guided import."""
 
@@ -465,11 +469,109 @@ def finished_import_config(
         roots.append(entry)
     else:
         roots[index] = entry
+    if add_category_subfolders:
+        roots.extend(
+            category_root_entries(
+                roots,
+                entry,
+                plan,
+                category_subfolders,
+                rat_subfolder_name=str(settings.get("rat_subfolder_name") or "rat"),
+            )
+        )
     result["roots"] = roots
     result["group_resolutions"] = True
     result["include_subfolders"] = True
     result["last_folder"] = _absolute_path(plan.root)
     return config.normalise_config(result)
+
+
+def category_root_entries(
+    existing_roots: Sequence[Mapping[str, object]],
+    parent_root: Mapping[str, object],
+    plan: PipelinePlan,
+    category_subfolders: Iterable[str],
+    *,
+    rat_subfolder_name: str = "rat",
+) -> list[dict[str, object]]:
+    """Build missing first-level category entries for imported originals.
+
+    Category names are relative to the analyzed source, while paths are always
+    landed beneath the plan's effective root (the source for in-place imports or
+    the destination for copy imports). Existing roots are left untouched.
+    """
+
+    seen_raw = {
+        os.fspath(root["path"])
+        for root in existing_roots
+        if root.get("path")
+    }
+    seen_resolved = {
+        _path_key(resolved)
+        for root in existing_roots
+        if root.get("path")
+        for resolved in [config.resolve_root_path(os.fspath(root["path"]))]
+        if resolved
+    }
+    imported_first_parts = set()
+    root_path = Path(plan.root)
+    for source in plan.sources:
+        try:
+            relative = Path(source).relative_to(root_path)
+        except ValueError:
+            continue
+        if len(relative.parts) >= 2 and Path(source).is_file():
+            imported_first_parts.add(relative.parts[0])
+
+    excluded = {
+        resize.rung_label(width).casefold() for width in PREPARE_RUNGS
+    }
+    excluded.add(str(rat_subfolder_name or "rat").casefold())
+    parent_label = str(parent_root.get("label") or "").strip()
+    if not parent_label:
+        parent_label = os.path.basename(os.path.normpath(plan.root)) or plan.root
+    extensions = list(parent_root.get("extensions") or ())
+    parent_raw = os.fspath(parent_root["path"])
+    parent_resolved = config.resolve_root_path(parent_raw)
+    result = []
+    added_names = set()
+    for value in category_subfolders:
+        name = str(value).strip()
+        if (
+            not name
+            or name in (".", "..")
+            or os.path.basename(name) != name
+            or "/" in name
+            or "\\" in name
+            or name.casefold() in excluded
+            or name not in imported_first_parts
+            or name.casefold() in added_names
+        ):
+            continue
+        resolved_path = str(root_path / name)
+        path = resolved_path
+        if (
+            config.has_path_variables(parent_raw)
+            and parent_resolved
+            and _path_key(parent_resolved) == _path_key(plan.root)
+        ):
+            path = os.path.join(parent_raw, name)
+        key = _path_key(resolved_path)
+        if path in seen_raw or key in seen_resolved:
+            continue
+        seen_raw.add(path)
+        seen_resolved.add(key)
+        added_names.add(name.casefold())
+        result.append(
+            {
+                "path": path,
+                "label": "{} / {}".format(parent_label, name),
+                "color": str(parent_root.get("color") or ""),
+                "extensions": list(extensions),
+                "include_in_all": parent_root.get("include_in_all") is not False,
+            }
+        )
+    return result
 
 
 def generated_root_entries(

@@ -217,6 +217,7 @@ def main(argv=None) -> int:
         assert migrated["lowres_overwrite_existing"] is False
         assert migrated["prepare_lowres_format"] == "both"
         assert migrated["prepare_generate_thumbnails"] is True
+        assert migrated["prepare_add_category_subfolders"] is True
         assert migrated["import_destination"] == ""
 
         # Version 2 stored richer root objects but still kept both format sets
@@ -276,6 +277,7 @@ def main(argv=None) -> int:
                 "lowres_also_rat": "yes",
                 "lowres_overwrite_existing": "yes",
                 "prepare_generate_thumbnails": "yes",
+                "prepare_add_category_subfolders": "yes",
                 "prepare_lowres_format": "invalid",
                 "import_destination": 42,
                 "include_subfolders": "yes",
@@ -302,6 +304,7 @@ def main(argv=None) -> int:
         assert strict["lowres_also_rat"] is False
         assert strict["lowres_overwrite_existing"] is False
         assert strict["prepare_generate_thumbnails"] is True
+        assert strict["prepare_add_category_subfolders"] is True
         assert strict["prepare_lowres_format"] == "both"
         assert strict["import_destination"] == ""
         assert strict["include_subfolders"] is False
@@ -420,6 +423,7 @@ def main(argv=None) -> int:
                 "lowres_overwrite_existing": True,
                 "prepare_auto_add_subfolders": False,
                 "prepare_generate_thumbnails": False,
+                "prepare_add_category_subfolders": False,
                 "prepare_lowres_format": "rat",
                 "import_destination": str(work / "library-destination"),
                 "include_subfolders": True,
@@ -442,6 +446,7 @@ def main(argv=None) -> int:
         assert loaded["lowres_overwrite_existing"] is True
         assert loaded["prepare_auto_add_subfolders"] is False
         assert loaded["prepare_generate_thumbnails"] is False
+        assert loaded["prepare_add_category_subfolders"] is False
         assert loaded["prepare_lowres_format"] == "rat"
         assert loaded["import_destination"] == str(work / "library-destination")
 
@@ -453,7 +458,8 @@ def main(argv=None) -> int:
         ]
         assert [Path(path).suffix for path in scans[0]] == [".rat"]
         assert {Path(path).suffix for path in scans[1]} == {".rat", ".hdr"}
-        print("CONFIG ok: v1/v2 migration, strict v9 normalization, round trip")
+        assert config.load_config(config_file)["prepare_add_category_subfolders"] is False
+        print("CONFIG ok: v1/v2 migration, strict v10 normalization, round trip")
 
         groups = variants.build_groups(
             [
@@ -618,6 +624,41 @@ def main(argv=None) -> int:
         assert scanned_analysis.image_count == 2
         assert scanned_analysis.has_rung_folders
         assert scanned_analysis.total_bytes == sum(path.stat().st_size for path in analysis_paths)
+
+        category_root = work / "category-analysis"
+        category_paths = [
+            category_root / "Nature" / "forest.hdr",
+            category_root / "Studio" / "softbox.exr",
+            category_root / "Lighting" / "warehouse.hdr",
+            category_root / "4k" / "generated.hdr",
+            category_root / "rat-cache" / "converted.rat",
+        ]
+        for path in category_paths:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"category fixture")
+        categorized = analyze.analyze_paths(
+            category_root,
+            category_paths,
+            dimensions={str(path): None for path in category_paths},
+            rat_subfolder_name="rat-cache",
+        )
+        assert categorized.category_subfolders == (
+            "Lighting",
+            "Nature",
+            "Studio",
+        )
+        assert categorized.categories_predominant
+        assert "4k" not in categorized.category_subfolders
+        assert "rat-cache" not in categorized.category_subfolders
+        flat_root = work / "flat-analysis"
+        flat_root.mkdir()
+        flat_image = flat_root / "flat.hdr"
+        flat_image.write_bytes(b"flat fixture")
+        flat = analyze.analyze_paths(
+            flat_root, [flat_image], dimensions={str(flat_image): None}
+        )
+        assert flat.category_subfolders == ()
+        assert not flat.categories_predominant
         print("ANALYZE ok: formats/buckets, structure, coverage, size, source picks")
 
         target_source = work / "targets" / "sunset.exr"
@@ -1020,6 +1061,91 @@ def main(argv=None) -> int:
                 "include_in_all": True,
             }
         ]
+
+        category_destination = work / "category-destination"
+        category_plan = prepare.build_pipeline_plan(
+            category_root,
+            categorized.original_paths,
+            copy_destination=category_destination,
+        )
+        category_copy_summary, category_copy_cancelled = prepare.run_pipeline(
+            category_plan
+        )
+        assert not category_copy_cancelled
+        assert category_copy_summary.copied == len(category_plan.sources)
+        existing_nature = {
+            "path": str(category_destination / "Nature"),
+            "label": "Custom nature",
+            "color": "#abcdef",
+            "extensions": [".hdr"],
+            "include_in_all": True,
+        }
+        category_settings = config.normalise_config(
+            {
+                "roots": [
+                    {
+                        "path": str(category_destination),
+                        "label": "Imported library",
+                        "color": "#123456",
+                        "extensions": [".exr"],
+                        "include_in_all": False,
+                    },
+                    existing_nature,
+                ],
+                "rat_subfolder_name": "rat-cache",
+            }
+        )
+        category_landed = prepare.finished_import_config(
+            category_settings,
+            category_plan,
+            add_category_subfolders=True,
+            category_subfolders=(
+                *categorized.category_subfolders,
+                "4k",
+                "rat-cache",
+            ),
+        )
+        category_by_path = {
+            root["path"]: root for root in category_landed["roots"]
+        }
+        landed_parent = category_by_path[str(category_destination)]
+        assert category_by_path[str(category_destination / "Nature")] == existing_nature
+        assert category_by_path[str(category_destination / "Lighting")] == {
+            "path": str(category_destination / "Lighting"),
+            "label": "Imported library / Lighting",
+            "color": "#123456",
+            "extensions": landed_parent["extensions"],
+            "include_in_all": False,
+        }
+        assert category_by_path[str(category_destination / "Studio")]["label"] == (
+            "Imported library / Studio"
+        )
+        assert str(category_destination / "4k") not in category_by_path
+        assert str(category_destination / "rat-cache") not in category_by_path
+        category_reimported = prepare.finished_import_config(
+            category_landed,
+            category_plan,
+            add_category_subfolders=True,
+            category_subfolders=categorized.category_subfolders,
+        )
+        assert category_reimported["roots"] == category_landed["roots"]
+
+        in_place_categories = prepare.finished_import_config(
+            config.DEFAULT_CONFIG,
+            prepare.build_pipeline_plan(category_root, categorized.original_paths),
+            add_category_subfolders=True,
+            category_subfolders=categorized.category_subfolders,
+        )
+        assert {
+            root["path"] for root in in_place_categories["roots"][1:]
+        } == {
+            str(category_root / "Lighting"),
+            str(category_root / "Nature"),
+            str(category_root / "Studio"),
+        }
+        assert in_place_categories["roots"][1]["label"].startswith(
+            "category-analysis / "
+        )
         print("COPY/LAND ok: preserve tree, identical skip, read-only source, cancellation, grouped root")
 
         original_parallel_rat = convert.convert_to_rat_parallel

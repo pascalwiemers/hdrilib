@@ -618,6 +618,18 @@ if QtCore is not None:
             destination_row.addWidget(self.import_destination_button)
             options_layout.addLayout(destination_row)
 
+            self.import_add_categories = QtWidgets.QCheckBox(
+                "Add top-level subfolders as separate entries"
+            )
+            self.import_add_categories.setChecked(False)
+            self.import_add_categories.setEnabled(False)
+            options_layout.addWidget(self.import_add_categories)
+            self.import_add_categories_note = QtWidgets.QLabel(
+                "No image-containing top-level category folders detected."
+            )
+            self.import_add_categories_note.setWordWrap(True)
+            options_layout.addWidget(self.import_add_categories_note)
+
             what_label = QtWidgets.QLabel("What to generate")
             what_label.setStyleSheet("font-weight: bold")
             options_layout.addWidget(what_label)
@@ -697,6 +709,9 @@ if QtCore is not None:
             self.import_copy_radio.toggled.connect(self._import_options_changed)
             self.import_generate_rat.toggled.connect(self._import_options_changed)
             self.import_generate_thumbnails.toggled.connect(
+                self._import_options_changed
+            )
+            self.import_add_categories.toggled.connect(
                 self._import_options_changed
             )
             self.import_lowres_format_combo.currentIndexChanged.connect(
@@ -998,6 +1013,7 @@ if QtCore is not None:
             self.import_generate_thumbnails.setChecked(
                 bool(self._settings.get("prepare_generate_thumbnails", True))
             )
+            self._update_import_category_option()
             self._import_options_changed()
             self._apply_icon_size()
             self.set_location_ui_mode(
@@ -1185,6 +1201,12 @@ if QtCore is not None:
                 structure.append("suffix variants")
             if result.has_legacy_rat_names:
                 structure.append("legacy RAT names")
+            if result.category_subfolders:
+                structure.append(
+                    "top-level categories: {}".format(
+                        ", ".join(result.category_subfolders)
+                    )
+                )
             structure_text = ", ".join(structure) or "no generated structure detected"
             return (
                 "{} logical HDRI{} · {} file{} · {}\n"
@@ -1205,10 +1227,44 @@ if QtCore is not None:
                 " ".join(result.notes),
             )
 
+        def _update_import_category_option(self):
+            result = self._import_analysis
+            detected = bool(
+                result is not None
+                and result.categories_predominant
+                and result.category_subfolders
+            )
+            self.import_add_categories.blockSignals(True)
+            self.import_add_categories.setEnabled(detected)
+            self.import_add_categories.setChecked(
+                detected
+                and bool(
+                    self._settings.get(
+                        "prepare_add_category_subfolders", True
+                    )
+                )
+            )
+            self.import_add_categories.blockSignals(False)
+            if detected:
+                self.import_add_categories_note.setText(
+                    "Detected categories: {}.".format(
+                        ", ".join(result.category_subfolders)
+                    )
+                )
+            elif result is not None and result.category_subfolders:
+                self.import_add_categories_note.setText(
+                    "Most imported images are at the library root, so category entries are disabled."
+                )
+            else:
+                self.import_add_categories_note.setText(
+                    "No image-containing top-level category folders detected."
+                )
+
         def _analyze_import_source(self, folder):
             path = os.path.abspath(os.path.expanduser(str(folder).strip())) if str(folder).strip() else ""
             if not path or not os.path.isdir(path):
                 self._import_analysis = None
+                self._update_import_category_option()
                 self.import_analysis_label.setText(
                     "Choose a readable folder for an instant, read-only analysis."
                 )
@@ -1227,12 +1283,14 @@ if QtCore is not None:
                 )
             except Exception as error:
                 self._import_analysis = None
+                self._update_import_category_option()
                 self.import_analysis_label.setText(
                     "Could not analyze this folder: {}".format(error)
                 )
                 self._import_options_changed()
                 return
             self._import_analysis = result
+            self._update_import_category_option()
             self.import_source_edit.setText(result.root)
             self.import_analysis_label.setText(self._analysis_text(result))
             useful = set(
@@ -1361,11 +1419,21 @@ if QtCore is not None:
                         "" if pending_thumbnails == 1 else "s",
                     )
                 )
+            if self.import_add_categories.isChecked():
+                parts.append(
+                    "add {} category entr{}".format(
+                        len(self._import_analysis.category_subfolders),
+                        "y"
+                        if len(self._import_analysis.category_subfolders) == 1
+                        else "ies",
+                    )
+                )
             has_work = bool(
                 plan.copy_sources
                 or plan.convert_originals
                 or plan.rungs
                 or self.import_generate_thumbnails.isChecked()
+                or self.import_add_categories.isChecked()
             )
             self.import_summary.setText("; ".join(parts) + ".")
             self.import_run_button.setEnabled(has_work and self._thread is None)
@@ -1384,6 +1452,10 @@ if QtCore is not None:
             self._settings["prepare_generate_thumbnails"] = (
                 self.import_generate_thumbnails.isChecked()
             )
+            if self.import_add_categories.isEnabled():
+                self._settings["prepare_add_category_subfolders"] = (
+                    self.import_add_categories.isChecked()
+                )
             if plan.copy_sources:
                 self._settings["import_destination"] = plan.root
             self._save()
@@ -1409,6 +1481,10 @@ if QtCore is not None:
                 "import": True,
                 "plan": plan,
                 "target": plan.root,
+                "add_category_subfolders": self.import_add_categories.isChecked(),
+                "category_subfolders": tuple(
+                    self._import_analysis.category_subfolders
+                ),
             }
             self._begin_job_progress("Importing", max(1, plan.total))
             self._set_job_controls(True)
@@ -3408,7 +3484,14 @@ if QtCore is not None:
                 plan = context.get("plan")
                 if not cancelled and plan is not None:
                     self._settings = prepare.finished_import_config(
-                        self._settings, plan
+                        self._settings,
+                        plan,
+                        add_category_subfolders=bool(
+                            context.get("add_category_subfolders")
+                        ),
+                        category_subfolders=context.get(
+                            "category_subfolders", ()
+                        ),
                     )
                     entry = self._root_by_resolved_path(plan.root)
                     if summary.failed:
