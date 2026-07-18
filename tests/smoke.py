@@ -313,6 +313,79 @@ def main(argv=None) -> int:
             == config.DEFAULT_THUMBNAIL_WORKERS
         )
 
+        project_base = work / "project"
+        project_hdri = project_base / "hdri"
+        project_hdri.mkdir(parents=True)
+        project_texture = project_hdri / "project.hdr"
+        project_texture.touch()
+        project_variable = "HDRILIB_SMOKE_PROJECT_ROOT"
+        os.environ[project_variable] = str(project_base)
+        os.environ.pop("HDRILIB_SMOKE_UNSET", None)
+        raw_project_root = "$HDRILIB_SMOKE_PROJECT_ROOT/hdri"
+        case_distinct_root = "$hdrilib_smoke_project_root/hdri"
+        variable_config = config.normalise_config(
+            {
+                "roots": [
+                    raw_project_root,
+                    raw_project_root,
+                    case_distinct_root,
+                ]
+            }
+        )
+        assert [root["path"] for root in variable_config["roots"]] == [
+            raw_project_root,
+            case_distinct_root,
+        ]
+        embedded_variable = "/shared/$HDRILIB_SMOKE_PROJECT_ROOT/hdri"
+        assert config.normalise_config({"roots": [embedded_variable]})["roots"][0][
+            "path"
+        ] == embedded_variable
+        assert config.resolve_root_path(raw_project_root) == str(project_hdri)
+        assert config.root_path_status(raw_project_root) == (
+            str(project_hdri),
+            "available",
+        )
+        moved_project = work / "moved-project"
+        (moved_project / "hdri").mkdir(parents=True)
+        os.environ[project_variable] = str(moved_project)
+        assert config.resolve_root_path(raw_project_root) == str(
+            moved_project / "hdri"
+        )
+        os.environ[project_variable] = str(project_base)
+        assert files.scan_files(raw_project_root, [".hdr"]) == [str(project_texture)]
+        assert prepare.scan_root(variable_config["roots"][0]) == [
+            str(project_texture)
+        ]
+        assert config.root_path_status(
+            "$HDRILIB_SMOKE_PROJECT_ROOT/missing"
+        ) == (str(project_base / "missing"), "missing")
+        assert config.resolve_root_path("$HDRILIB_SMOKE_UNSET/hdri") == ""
+        assert config.root_path_status("$HDRILIB_SMOKE_UNSET/hdri") == (
+            "",
+            "unresolved",
+        )
+        variable_file = work / "variable-config.json"
+        saved_variables = config.save_config(variable_config, variable_file)
+        assert config.load_config(variable_file) == saved_variables
+        assert saved_variables["roots"][0]["path"] == raw_project_root
+        variable_plan = prepare.build_pipeline_plan(
+            project_hdri, [project_texture]
+        )
+        landed_variable = prepare.finished_import_config(
+            variable_config, variable_plan
+        )
+        assert landed_variable["roots"][0]["path"] == raw_project_root
+        generated_variable = prepare.generated_root_entries(
+            variable_config["roots"],
+            variable_config["roots"][0],
+            [(project_hdri / "4k", "4k", False)],
+        )
+        assert generated_variable[0]["path"] == raw_project_root + "/4k"
+        print(
+            "VARIABLE ROOTS ok: raw round trip/dedupe, live env resolution, "
+            "unavailable states, scan and import preservation"
+        )
+
         rat_root = work / "rat-root"
         all_root = work / "all-root"
         rat_root.mkdir()

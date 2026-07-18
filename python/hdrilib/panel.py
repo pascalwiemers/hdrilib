@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+import weakref
 from collections import deque
 from pathlib import Path
 
@@ -362,10 +363,12 @@ if QtCore is not None:
             self._root_format_buttons = {}
             self._updating_roots = False
             self._syncing_location = False
+            self._hip_file_callback = None
             self._build_ui()
             self._restore_ui()
             self._rebuild_root_settings()
             self._rebuild_locations()
+            self._register_hip_file_callback()
 
         def _build_ui(self):
             self.setObjectName("hdrilibPanel")
@@ -413,6 +416,21 @@ if QtCore is not None:
             self.location_label = QtWidgets.QLabel("Location")
             self.location_combo = QtWidgets.QComboBox()
             self.location_combo.setMinimumWidth(220)
+            self.location_combo.setEditable(True)
+            self.location_combo.setInsertPolicy(
+                _enum(QtWidgets.QComboBox, "InsertPolicy", "NoInsert")
+            )
+            completer = self.location_combo.completer()
+            if completer is not None:
+                completer.setCaseSensitivity(
+                    _enum(QtCore.Qt, "CaseSensitivity", "CaseInsensitive")
+                )
+                try:
+                    completer.setFilterMode(
+                        _enum(QtCore.Qt, "MatchFlag", "MatchContains")
+                    )
+                except AttributeError:
+                    pass
             self.refresh_button = QtWidgets.QPushButton("Refresh")
             # Kept as private compatibility handles for old host scripts; guided
             # import owns these actions now and the buttons are intentionally hidden.
@@ -707,6 +725,9 @@ if QtCore is not None:
             roots_layout.addWidget(self.roots_list)
             root_buttons = QtWidgets.QHBoxLayout()
             self.settings_add_root = QtWidgets.QPushButton("Import folder…")
+            self.settings_add_project_root = QtWidgets.QPushButton(
+                "Add project folder…"
+            )
             self.settings_remove_root = QtWidgets.QPushButton("Remove")
             self.settings_move_up = QtWidgets.QPushButton("Move up")
             self.settings_move_down = QtWidgets.QPushButton("Move down")
@@ -714,6 +735,7 @@ if QtCore is not None:
             self.settings_clear_color = QtWidgets.QPushButton("Clear color")
             for button in (
                 self.settings_add_root,
+                self.settings_add_project_root,
                 self.settings_remove_root,
                 self.settings_move_up,
                 self.settings_move_down,
@@ -819,6 +841,7 @@ if QtCore is not None:
             layout.addLayout(options_grid)
 
             self.settings_add_root.clicked.connect(self._open_import_picker)
+            self.settings_add_project_root.clicked.connect(self._add_project_root)
             self.settings_remove_root.clicked.connect(self._remove_root)
             self.settings_move_up.clicked.connect(lambda: self._move_root(-1))
             self.settings_move_down.clicked.connect(lambda: self._move_root(1))
@@ -1100,7 +1123,12 @@ if QtCore is not None:
             self._choose_import_source()
 
         def _open_import_for_folder(self, folder, preset=None):
-            path = os.path.abspath(os.path.expanduser(os.fspath(folder)))
+            path = config.resolve_root_path(os.fspath(folder))
+            if not path or not os.path.isdir(path):
+                self.status.setText(
+                    "{} is not available in this scene.".format(os.fspath(folder))
+                )
+                return
             self.tabs.setCurrentWidget(self.import_tab)
             self.import_source_edit.setText(path)
             self._analyze_import_source(path)
@@ -1394,8 +1422,33 @@ if QtCore is not None:
         def _root_entries(self):
             return self._settings.get("roots", [])
 
+        def _root_resolved_path(self, root):
+            return config.resolve_root_path(root.get("path", "")) if root else ""
+
+        def _root_location(self, root):
+            return (
+                config.root_path_status(root.get("path", ""))
+                if root
+                else ("", "unresolved")
+            )
+
         def _root_display_name(self, root):
-            return root.get("label") or os.path.basename(root["path"]) or root["path"]
+            raw = root["path"]
+            label = root.get("label") or ""
+            if config.has_path_variables(raw):
+                return "{} — {}".format(label, raw) if label else raw
+            return label or os.path.basename(raw) or raw
+
+        def _root_location_tooltip(self, root):
+            raw = root["path"]
+            resolved, status = self._root_location(root)
+            if status == "available":
+                return "{}\nResolved location: {}".format(raw, resolved)
+            if status == "missing" and resolved:
+                return "{}\nResolved location: {}\n(not available in this scene)".format(
+                    raw, resolved
+                )
+            return "{}\n(not available in this scene)".format(raw)
 
         def _root_by_path(self, path):
             return next(
@@ -1403,27 +1456,50 @@ if QtCore is not None:
                 None,
             )
 
+        def _root_by_resolved_path(self, path):
+            if not path:
+                return None
+            absolute = os.path.abspath(os.path.expanduser(os.fspath(path)))
+            return next(
+                (
+                    root
+                    for root in self._root_entries()
+                    if self._root_resolved_path(root) == absolute
+                ),
+                None,
+            )
+
         def _root_for_folder(self, folder=None):
-            folder = os.path.abspath(folder or self._folder) if folder or self._folder else ""
+            folder = folder or self._folder
+            if config.has_path_variables(folder):
+                folder = config.resolve_root_path(folder)
+            folder = os.path.abspath(folder) if folder else ""
             if not folder:
                 return None
             hinted_root = self._root_by_path(self._folder_root)
             if hinted_root is not None:
+                hinted_path = self._root_resolved_path(hinted_root)
                 try:
-                    if os.path.commonpath([folder, hinted_root["path"]]) == hinted_root["path"]:
+                    if hinted_path and os.path.commonpath([folder, hinted_path]) == hinted_path:
                         return hinted_root
                 except (OSError, ValueError):
                     pass
             matches = []
             for root in self._root_entries():
-                root_path = root["path"]
+                root_path = self._root_resolved_path(root)
+                if not root_path:
+                    continue
                 try:
                     inside = os.path.commonpath([folder, root_path]) == root_path
                 except (OSError, ValueError):
                     inside = False
                 if inside:
                     matches.append(root)
-            return max(matches, key=lambda root: len(root["path"])) if matches else None
+            return (
+                max(matches, key=lambda root: len(self._root_resolved_path(root)))
+                if matches
+                else None
+            )
 
         def _format_count_text(self, root):
             return "Formats ({}/{})".format(
@@ -1468,6 +1544,7 @@ if QtCore is not None:
             self.roots_list.clear()
             self._root_format_buttons.clear()
             for root in self._root_entries():
+                _resolved, availability = self._root_location(root)
                 item = QtWidgets.QTreeWidgetItem(
                     self.roots_list,
                     [
@@ -1477,7 +1554,9 @@ if QtCore is not None:
                         self._format_count_text(root),
                     ],
                 )
-                item.setToolTip(0, root["path"])
+                item.setToolTip(0, self._root_location_tooltip(root))
+                if availability != "available":
+                    item.setForeground(0, QtGui.QBrush(QtGui.QColor("#888888")))
                 item.setFlags(item.flags() | ITEM_IS_EDITABLE)
                 item.setIcon(2, self._color_icon(root.get("color", "")))
                 self.roots_list.setItemWidget(
@@ -1536,7 +1615,8 @@ if QtCore is not None:
                 self._choose_root_color()
 
         def _root_scope(self, root):
-            if root is None or not os.path.isdir(root.get("path", "")):
+            resolved = self._root_resolved_path(root)
+            if root is None or not resolved or not os.path.isdir(resolved):
                 return [], {}, ()
             paths = prepare.scan_root(root)
             dimensions = {}
@@ -1810,8 +1890,12 @@ if QtCore is not None:
             layout.addWidget(buttons)
             if self._dialog_result(dialog) != DIALOG_ACCEPTED:
                 return
+            resolved_root = config.resolve_root_path(root_path)
+            if not resolved_root:
+                self.status.setText("The selected project folder is not available.")
+                return
             plan = prepare.build_pipeline_plan(
-                root_path,
+                resolved_root,
                 paths,
                 convert_to_rat=convert_rat,
                 rungs=rungs,
@@ -1900,8 +1984,12 @@ if QtCore is not None:
             if not convert_box.isChecked() and not rungs:
                 self.status.setText("Choose at least one preparation action.")
                 return
+            resolved_root = config.resolve_root_path(root_path)
+            if not resolved_root:
+                self.status.setText("The selected project folder is not available.")
+                return
             plan = prepare.build_pipeline_plan(
-                root_path,
+                resolved_root,
                 paths,
                 convert_to_rat=convert_box.isChecked(),
                 rungs=rungs,
@@ -2019,6 +2107,57 @@ if QtCore is not None:
             self._save()
             self._rebuild_root_settings(row)
             self._rebuild_locations()
+
+        def _add_project_root(self):
+            presets = ("$HIP/hdri", "$HIP/tex", "$JOB/hdri", "$JOB/tex")
+            value, accepted = QtWidgets.QInputDialog.getItem(
+                self,
+                "Add project folder",
+                "Variable path (choose a preset or type a custom $VAR path):",
+                presets,
+                0,
+                True,
+            )
+            if not accepted:
+                return
+            raw = str(value).strip()
+            if not config.has_path_variables(raw):
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Add project folder",
+                    "Enter a path containing a $VAR or ${VAR} token.",
+                )
+                return
+            roots = self._root_entries()
+            existing = next(
+                (index for index, root in enumerate(roots) if root["path"] == raw),
+                None,
+            )
+            if existing is None:
+                roots.append(
+                    {
+                        "path": raw,
+                        "label": "",
+                        "color": "",
+                        "extensions": list(config.DEFAULT_EXTENSIONS),
+                        "include_in_all": True,
+                    }
+                )
+                row = len(roots) - 1
+            else:
+                row = existing
+            resolved, availability = config.root_path_status(raw)
+            self._folder_root = raw
+            if resolved:
+                self._folder = resolved
+            self._save()
+            self._rebuild_root_settings(row)
+            self._rebuild_locations()
+            self.status.setText(
+                "Added project folder {}.".format(raw)
+                if availability == "available"
+                else "Added project folder {}; it is not available in this scene.".format(raw)
+            )
 
         def _selected_root_rows(self):
             roots = self._root_entries()
@@ -2154,12 +2293,19 @@ if QtCore is not None:
                 return
             for row in reversed(rows):
                 removed = roots.pop(row)["path"]
-                if self._folder == removed or self._folder.startswith(removed + os.sep):
+                resolved_removed = config.resolve_root_path(removed)
+                if self._folder_root == removed or (
+                    resolved_removed
+                    and (
+                        self._folder == resolved_removed
+                        or self._folder.startswith(resolved_removed + os.sep)
+                    )
+                ):
                     self._folder = ""
                     self._folder_root = ""
             if not self._folder and roots:
-                self._folder = roots[0]["path"]
                 self._folder_root = roots[0]["path"]
+                self._folder = self._root_resolved_path(roots[0])
             self._save()
             self._rebuild_root_settings(min(rows[0], len(roots) - 1))
             self._rebuild_locations()
@@ -2220,15 +2366,22 @@ if QtCore is not None:
                 item.setIcon(0, icon)
                 self._add_tree_directory(directory.path, item, root)
 
-        def _add_combo_folder(self, path, label, root, seen_paths):
+        def _add_combo_folder(
+            self, path, label, root, seen_paths, tooltip=None, enabled=True
+        ):
             key = (root["path"], path)
             if key in seen_paths:
                 return
             seen_paths.add(key)
             self.location_combo.addItem(self._color_icon(root.get("color", "")), label, path)
             index = self.location_combo.count() - 1
-            self.location_combo.setItemData(index, path, TOOLTIP_ROLE)
+            self.location_combo.setItemData(index, tooltip or path, TOOLTIP_ROLE)
             self.location_combo.setItemData(index, root["path"], ROOT_ROLE)
+            model_item = getattr(self.location_combo.model(), "item", lambda _index: None)(
+                index
+            )
+            if model_item is not None:
+                model_item.setEnabled(enabled)
 
         def _combo_folder_index(self, path, root_path=""):
             for index in range(self.location_combo.count()):
@@ -2263,19 +2416,50 @@ if QtCore is not None:
                 if preferred_root is not None:
                     preferred_root_path = preferred_root["path"]
             for root in self._root_entries():
-                path = root["path"]
-                if not os.path.isdir(path):
-                    continue
+                raw_path = root["path"]
+                path, availability = self._root_location(root)
+                available = availability == "available"
                 label = self._root_display_name(root)
+                display_label = (
+                    label
+                    if available
+                    else "{} — not available in this scene".format(label)
+                )
                 item = QtWidgets.QTreeWidgetItem(self.folder_tree, [label])
-                item.setToolTip(0, path)
-                item.setData(0, USER_ROLE, path)
-                item.setData(0, ROOT_ROLE, path)
+                if not available:
+                    item.setText(0, display_label)
+                    item.setDisabled(True)
+                item.setToolTip(0, self._root_location_tooltip(root))
+                item.setData(0, USER_ROLE, path or raw_path)
+                item.setData(0, ROOT_ROLE, raw_path)
                 item.setIcon(0, self._color_icon(root.get("color", "")))
-                self._add_combo_folder(path, label, root, seen_combo_paths)
-                self._add_tree_directory(path, item, root)
-                if self._folder == path:
+                self._add_combo_folder(
+                    path or raw_path,
+                    display_label,
+                    root,
+                    seen_combo_paths,
+                    tooltip=self._root_location_tooltip(root),
+                    enabled=available,
+                )
+                if available:
+                    self._add_tree_directory(path, item, root)
+                current_inside = False
+                if available and self._folder:
+                    try:
+                        current_inside = os.path.commonpath([self._folder, path]) == path
+                    except (OSError, ValueError):
+                        pass
+                if available and self._folder == path:
                     selected_item = item
+                elif (
+                    available
+                    and preferred_root_path == raw_path
+                    and not current_inside
+                ):
+                    # The same raw project root now points somewhere else after
+                    # a hip-file change. Follow its fresh expansion.
+                    selected_item = item
+                    self._folder = path
 
             if self._folder and selected_item is None:
                 iterator = QtWidgets.QTreeWidgetItemIterator(self.folder_tree)
@@ -2291,8 +2475,12 @@ if QtCore is not None:
             if selected_item is None and self.folder_tree.topLevelItemCount():
                 # Prefer the first real root over the aggregate view so a fresh
                 # session does not start with a full multi-root scan.
-                index = 1 if self.folder_tree.topLevelItemCount() > 1 else 0
-                selected_item = self.folder_tree.topLevelItem(index)
+                selected_item = self.folder_tree.topLevelItem(0)
+                for index in range(1, self.folder_tree.topLevelItemCount()):
+                    candidate = self.folder_tree.topLevelItem(index)
+                    if not candidate.isDisabled():
+                        selected_item = candidate
+                        break
                 self._folder = selected_item.data(0, USER_ROLE)
             if selected_item is not None:
                 self._folder_root = selected_item.data(0, ROOT_ROLE)
@@ -2470,6 +2658,43 @@ if QtCore is not None:
             self._rebuild_locations()
             self.status.setText("Folder list refreshed.")
 
+        def _register_hip_file_callback(self):
+            if self._hip_file_callback is not None:
+                return
+            try:
+                import hou  # type: ignore
+            except ImportError:
+                return
+            panel_ref = weakref.ref(self)
+
+            def hip_file_changed(_event_type):
+                panel = panel_ref()
+                if panel is not None:
+                    QtCore.QTimer.singleShot(0, panel._refresh_after_hip_change)
+
+            try:
+                hou.hipFile.addEventCallback(hip_file_changed)
+            except (AttributeError, RuntimeError):
+                return
+            self._hip_file_callback = hip_file_changed
+
+        def _remove_hip_file_callback(self):
+            callback = self._hip_file_callback
+            self._hip_file_callback = None
+            if callback is None:
+                return
+            try:
+                import hou  # type: ignore
+
+                hou.hipFile.removeEventCallback(callback)
+            except (ImportError, AttributeError, RuntimeError):
+                pass
+
+        def _refresh_after_hip_change(self):
+            self._rebuild_root_settings()
+            self._rebuild_locations()
+            self.status.setText("Project folders updated for the current scene.")
+
         def _update_browse_empty(self):
             empty = not bool(self._root_entries())
             self.browse_empty.setVisible(empty)
@@ -2481,10 +2706,11 @@ if QtCore is not None:
                 if not root.get("include_in_all", True):
                     continue
                 extensions = root.get("extensions", ())
-                if not extensions or not os.path.isdir(root["path"]):
+                root_path = self._root_resolved_path(root)
+                if not extensions or not root_path or not os.path.isdir(root_path):
                     continue
                 found.update(
-                    files.scan_files(root["path"], extensions=extensions, recursive=True)
+                    files.scan_files(root_path, extensions=extensions, recursive=True)
                 )
             return sorted(found, key=lambda value: (os.path.basename(value).lower(), value))
 
@@ -2898,7 +3124,7 @@ if QtCore is not None:
                 if not plan.total:
                     self.status.setText("No matching work was found for this action.")
                 return
-            parent = self._root_by_path(plan.root)
+            parent = self._root_by_resolved_path(plan.root)
             if parent is None:
                 self.status.setText("The selected root is no longer in Settings.")
                 return
@@ -2945,7 +3171,7 @@ if QtCore is not None:
             self._job_kind = "prepare"
             self._generation_errors = 0
             self._prepare_context = {
-                "parent_path": plan.root,
+                "parent_path": parent["path"],
                 "add_roots": bool(add_roots),
                 "generated": generated,
                 "description": description,
@@ -3184,7 +3410,7 @@ if QtCore is not None:
                     self._settings = prepare.finished_import_config(
                         self._settings, plan
                     )
-                    entry = self._root_by_path(plan.root)
+                    entry = self._root_by_resolved_path(plan.root)
                     if summary.failed:
                         present = {
                             files.extension_for(path, config.DEFAULT_EXTENSIONS)
@@ -3208,10 +3434,12 @@ if QtCore is not None:
                     self.include_subfolders.setChecked(True)
                     self.include_subfolders.blockSignals(False)
                     self._folder = plan.root
-                    self._folder_root = plan.root
+                    self._folder_root = entry["path"] if entry is not None else plan.root
                     self._save()
                     self._rebuild_root_settings(
-                        self._root_entries().index(self._root_by_path(plan.root))
+                        self._root_entries().index(entry)
+                        if entry is not None
+                        else None
                     )
                     self._rebuild_locations()
                     self.tabs.setCurrentWidget(self.browse_tab)
@@ -3298,6 +3526,7 @@ if QtCore is not None:
 
         def closeEvent(self, event):
             self._save()
+            self._remove_hip_file_callback()
             if self._worker is not None:
                 self._worker.cancel()
             super().closeEvent(event)

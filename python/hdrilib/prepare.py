@@ -103,7 +103,9 @@ def scan_root(root: Mapping[str, object]) -> list[str]:
     so repeatedly preparing a root never nests or compounds generated variants.
     """
 
-    root_path = os.path.abspath(os.path.expanduser(os.fspath(root["path"])))
+    root_path = config.resolve_root_path(os.fspath(root["path"]))
+    if not root_path:
+        return []
     extensions = root.get("extensions", ())
     if not isinstance(extensions, (list, tuple, set)) or not extensions:
         return []
@@ -440,16 +442,25 @@ def finished_import_config(
     result = dict(settings)
     roots = [dict(root) for root in settings.get("roots", [])]
     root_key = _path_key(plan.root)
+
+    def resolved_key(root: Mapping[str, object]) -> str:
+        if not root.get("path"):
+            return ""
+        resolved = config.resolve_root_path(os.fspath(root["path"]))
+        return _path_key(resolved) if resolved else ""
+
     index = next(
         (
             position
             for position, root in enumerate(roots)
-            if root.get("path") and _path_key(root["path"]) == root_key
+            if resolved_key(root) == root_key
         ),
         None,
     )
     existing = roots[index] if index is not None else None
     entry = finished_import_root_entry(plan, existing_root=existing)
+    if existing is not None and config.has_path_variables(existing.get("path")):
+        entry["path"] = existing["path"]
     if index is None:
         roots.append(entry)
     else:
@@ -468,19 +479,41 @@ def generated_root_entries(
 ) -> list[dict[str, object]]:
     """Return deduplicated roots for generated folders, inheriting parent attrs."""
 
-    seen = {_path_key(root["path"]) for root in existing_roots if root.get("path")}
+    seen_raw = {
+        os.fspath(root["path"]) for root in existing_roots if root.get("path")
+    }
+    seen_resolved = {
+        _path_key(resolved)
+        for root in existing_roots
+        if root.get("path")
+        for resolved in [config.resolve_root_path(os.fspath(root["path"]))]
+        if resolved
+    }
     parent_label = str(parent_root.get("label") or "").strip()
     if not parent_label:
         parent_path = os.fspath(parent_root["path"])
         parent_label = os.path.basename(os.path.normpath(parent_path)) or parent_path
     inherited_extensions = list(parent_root.get("extensions") or ())
+    parent_raw = os.fspath(parent_root["path"])
+    parent_resolved = config.resolve_root_path(parent_raw)
     result = []
     for folder, suffix, output_format in folders:
-        path = _absolute_path(folder)
-        key = _path_key(path)
-        if key in seen:
+        resolved_path = _absolute_path(folder)
+        path = resolved_path
+        if config.has_path_variables(parent_raw) and parent_resolved:
+            try:
+                relative = os.path.relpath(resolved_path, parent_resolved)
+                if relative != os.pardir and not relative.startswith(
+                    os.pardir + os.sep
+                ):
+                    path = os.path.join(parent_raw, relative)
+            except ValueError:
+                pass
+        key = _path_key(resolved_path)
+        if path in seen_raw or key in seen_resolved:
             continue
-        seen.add(key)
+        seen_raw.add(path)
+        seen_resolved.add(key)
         if output_format is True or output_format == "rat":
             extensions = [".rat"]
         elif output_format == "both":

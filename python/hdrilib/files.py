@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 from typing import Iterable, Iterator
 
-from .config import DEFAULT_EXTENSIONS
+from .config import DEFAULT_EXTENSIONS, resolve_root_path
 
 # NAS/system metadata folders that hold fake image files (Synology thumbnails,
 # recycle bins, Substance .alg_meta, macOS AppleDouble companions).
@@ -55,7 +55,10 @@ def iter_files(
 ) -> Iterator[str]:
     """Yield matching files below one folder, silently skipping unreadable entries."""
 
-    root = Path(folder).expanduser()
+    resolved = resolve_root_path(folder)
+    if not resolved:
+        return
+    root = Path(resolved)
     if not root.is_dir():
         return
     if recursive:
@@ -108,7 +111,10 @@ def scan_files(
 def iter_folders(root: str | os.PathLike[str]) -> Iterator[str]:
     """Yield *root* and its readable subdirectories in display order."""
 
-    root_path = Path(root).expanduser()
+    resolved = resolve_root_path(root)
+    if not resolved:
+        return
+    root_path = Path(resolved)
     if not root_path.is_dir():
         return
     yield os.path.abspath(os.fspath(root_path))

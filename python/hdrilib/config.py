@@ -27,6 +27,10 @@ DEFAULT_EXTENSIONS = (
 SCHEMA_VERSION = 9
 DEFAULT_THUMBNAIL_WORKERS = min(8, os.cpu_count() or 1)
 _COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+_VARIABLE_RE = re.compile(
+    r"\$(?:\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)\}|"
+    r"(?P<plain>[A-Za-z_][A-Za-z0-9_]*))"
+)
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "version": SCHEMA_VERSION,
@@ -115,13 +119,80 @@ def _normalise_root(
 
     if not raw_path or not os.fspath(raw_path).strip():
         return None
+    path = os.fspath(raw_path).strip()
     return {
-        "path": os.path.abspath(os.path.expanduser(os.fspath(raw_path))),
+        # Houdini variables are deliberately preserved. Their value can change
+        # whenever the current hip file changes, so expanding them here would
+        # turn a portable root into a stale machine-specific path.
+        "path": (
+            path
+            if has_path_variables(path)
+            else os.path.abspath(os.path.expanduser(path))
+        ),
         "label": label,
         "color": color,
         "extensions": extensions,
         "include_in_all": include_in_all,
     }
+
+
+def has_path_variables(path: object) -> bool:
+    """Return whether *path* contains a supported ``$VAR``/``${VAR}`` token."""
+
+    return isinstance(path, (str, os.PathLike)) and bool(
+        _VARIABLE_RE.search(os.fspath(path))
+    )
+
+
+def _variable_names(path: str) -> tuple[str, ...]:
+    return tuple(
+        match.group("braced") or match.group("plain")
+        for match in _VARIABLE_RE.finditer(path)
+    )
+
+
+def resolve_root_path(path: str | os.PathLike[str]) -> str:
+    """Expand a configured root for immediate filesystem use.
+
+    Houdini owns the authoritative values for ``$HIP``, ``$JOB``, and other
+    scene variables. Plain Python falls back to the process environment. An
+    unset variable returns an empty string instead of accidentally treating the
+    raw token as a relative folder. No result is cached.
+    """
+
+    raw = os.fspath(path).strip()
+    if not raw:
+        return ""
+    expanded = raw
+    if has_path_variables(raw):
+        try:
+            import hou  # type: ignore
+
+            getenv = getattr(hou, "getenv", None)
+            if getenv is not None:
+                for name in _variable_names(raw):
+                    if getenv(name):
+                        continue
+                    single = hou.text.expandString("$" + name)
+                    if not single or has_path_variables(single):
+                        return ""
+            expanded = hou.text.expandString(raw)
+        except Exception:
+            if any(not os.environ.get(name) for name in _variable_names(raw)):
+                return ""
+            expanded = os.path.expandvars(raw)
+        if has_path_variables(expanded):
+            return ""
+    return os.path.abspath(os.path.expanduser(expanded))
+
+
+def root_path_status(path: str | os.PathLike[str]) -> tuple[str, str]:
+    """Return ``(resolved_path, status)`` for display and availability checks."""
+
+    resolved = resolve_root_path(path)
+    if not resolved:
+        return "", "unresolved"
+    return resolved, "available" if os.path.isdir(resolved) else "missing"
 
 
 def _normalise_extensions(values: object, fallback: list[str]) -> list[str]:
